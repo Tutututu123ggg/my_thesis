@@ -1,0 +1,137 @@
+# =========================
+# Environment / secrets
+# =========================
+.env
+.env.local
+.env.dev
+.env.prod
+*.env
+
+# Keep env template
+!.env.example
+
+# =========================
+# Python virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Python cache
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# IDE / editor
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+data/logs/*
+!data/logs/.gitkeep
+
+# =========================
+# Data files - ignore generated/heavy data
+# =========================
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/articles/
+!data/raw/crawl_logs/
+data/raw/articles/*
+data/raw/crawl_logs/*
+!data/raw/articles/.gitkeep
+!data/raw/crawl_logs/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+!data/processed/cleaned_articles/
+!data/processed/normalized_articles/
+data/processed/cleaned_articles/*
+data/processed/normalized_articles/*
+!data/processed/cleaned_articles/.gitkeep
+!data/processed/normalized_articles/.gitkeep
+
+data/chunks/*
+!data/chunks/.gitkeep
+
+data/extraction/*
+!data/extraction/.gitkeep
+
+data/graph_exports/*
+!data/graph_exports/.gitkeep
+
+data/vector_store/*
+!data/vector_store/.gitkeep
+!data/vector_store/faiss/
+!data/vector_store/bm25/
+!data/vector_store/embeddings/
+data/vector_store/faiss/*
+data/vector_store/bm25/*
+data/vector_store/embeddings/*
+!data/vector_store/faiss/.gitkeep
+!data/vector_store/bm25/.gitkeep
+!data/vector_store/embeddings/.gitkeep
+
+data/evaluation/*
+!data/evaluation/.gitkeep
+!data/evaluation/benchmarks/
+!data/evaluation/runs/
+!data/evaluation/ragas_results/
+!data/evaluation/retrieval_debug/
+data/evaluation/benchmarks/*
+data/evaluation/runs/*
+data/evaluation/ragas_results/*
+data/evaluation/retrieval_debug/*
+!data/evaluation/benchmarks/.gitkeep
+!data/evaluation/runs/.gitkeep
+!data/evaluation/ragas_results/.gitkeep
+!data/evaluation/retrieval_debug/.gitkeep
+
+# =========================
+# Model / embedding cache
+# =========================
+.cache/
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# =========================
+# Database / vector index local files
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*.faiss
+*.index
+*.pkl
+*.pickle
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
