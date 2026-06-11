@@ -55,6 +55,7 @@ data/logs/*
 # =========================
 # Data files - ignore generated/heavy data
 # =========================
+data/*
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/articles/

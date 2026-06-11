@@ -44,10 +44,16 @@ class EntityNode(BaseModel):
     normalized_name: str
     entity_type: str
 
+    # aliases: metadata/debug only; không dùng để hard-merge entity.
     aliases: list[str] = Field(default_factory=list)
+
+    # surface_forms: metadata/debug only; không dùng để hard-merge entity.
+    surface_forms: list[str] = Field(default_factory=list)
+
     description: str | None = None
 
-    # Dành cho LightRAG-style.
+    # Dành cho LightRAG-style. Query low/high-level keywords KHÔNG nằm ở đây.
+    # local_keys/global_keys giữ lại để backward-compatible/cache nếu sau này cần.
     profile_text: str | None = None
     local_keys: list[str] = Field(default_factory=list)
     global_keys: list[str] = Field(default_factory=list)
@@ -66,6 +72,9 @@ class MedicalRelation(BaseModel):
     subject_entity_id: str
     object_entity_id: str
     relation_type: str
+
+    description: str | None = None
+    keywords: list[str] = Field(default_factory=list)
 
     evidence_text: str
     evidence_chunk_ids: list[str] = Field(default_factory=list)
@@ -88,6 +97,9 @@ class MedicalRelationView(BaseModel):
     object_entity_id: str
     object_name: str
     object_type: str
+
+    description: str | None = None
+    keywords: list[str] = Field(default_factory=list)
 
     evidence_text: str | None = None
     evidence_chunk_ids: list[str] = Field(default_factory=list)

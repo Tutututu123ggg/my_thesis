@@ -25,7 +25,7 @@ class GraphRepository:
     Cổng duy nhất để các module khác giao tiếp với Neo4j.
 
     Rule:
-    - Không viết Cypher ngoài infrastructure/database.
+    - Không viết Cypher ngoài infrastructure/graph_database.
     - Không trả raw Neo4j Record ra ngoài.
     - Không lưu dict trực tiếp vào Neo4j, luôn serialize thành metadata_json.
     """
@@ -95,10 +95,11 @@ class GraphRepository:
         params["metadata_json"] = self._to_json(entity.metadata)
         params.pop("metadata", None)
 
-        # Neo4j không lưu property null, nên ép default để tránh missing property warnings
+        # Neo4j không lưu property null, nên ép default để tránh missing property warnings.
         params["description"] = params.get("description") or ""
-        params["profile_text"] = params.get("profile_text") or ""
+        params["profile_text"] = params.get("profile_text") or params["description"]
         params["aliases"] = params.get("aliases") or []
+        params["surface_forms"] = params.get("surface_forms") or [entity.name]
         params["local_keys"] = params.get("local_keys") or []
         params["global_keys"] = params.get("global_keys") or []
         params["mention_count"] = params.get("mention_count") or 0
@@ -121,8 +122,8 @@ class GraphRepository:
             "chunk_id": chunk_id,
             "entity_id": entity_id,
             "confidence": float(confidence),
-            "evidence_text": evidence_text,
-            "section": section,
+            "evidence_text": evidence_text or "",
+            "section": section or "",
         }
 
         with self.client.session() as session:
@@ -151,30 +152,17 @@ class GraphRepository:
         params["metadata_json"] = self._to_json(relation.metadata)
         params.pop("metadata", None)
 
+        params["description"] = params.get("description") or ""
+        params["keywords"] = params.get("keywords") or []
+        params["evidence_chunk_ids"] = params.get("evidence_chunk_ids") or []
+        params["confidence"] = float(params.get("confidence") or 1.0)
+        params["section"] = params.get("section") or ""
+        params["source_url"] = params.get("source_url") or ""
+
         with self.client.session() as session:
             session.run(q.UPSERT_MEDICAL_RELATION, params)
 
         return True
-
-    def upsert_synonym(
-        self,
-        entity_id_1: str,
-        entity_id_2: str,
-        score: float = 1.0,
-        method: str = "alias",
-    ) -> None:
-        if entity_id_1 == entity_id_2:
-            return
-
-        params = {
-            "entity_id_1": entity_id_1,
-            "entity_id_2": entity_id_2,
-            "score": float(score),
-            "method": method,
-        }
-
-        with self.client.session() as session:
-            session.run(q.UPSERT_SYNONYM, params)
 
     # =====================
     # Read methods
@@ -237,6 +225,29 @@ class GraphRepository:
             result = session.run(q.GET_NEIGHBOR_ENTITIES, params)
             return [self._record_to_entity(record) for record in result]
 
+    def get_synonym_neighbors(
+        self,
+        entity_ids: list[str],
+        limit: int = 30,
+    ) -> list[EntityNode]:
+        """
+        Lấy các entity đồng nghĩa qua edge MEDICAL_RELATION relation_type=DONG_NGHIA_VOI.
+
+        Đây là expansion edge cho retrieval, không phải hard merge/canonicalize.
+        Query dùng quan hệ vô hướng vì đồng nghĩa là đối xứng về mặt retrieval.
+        """
+        if not entity_ids:
+            return []
+
+        params = {
+            "entity_ids": entity_ids,
+            "limit": limit,
+        }
+
+        with self.client.session() as session:
+            result = session.run(q.GET_SYNONYM_NEIGHBORS, params)
+            return [self._record_to_entity(record) for record in result]
+
     def get_graph_stats(self) -> dict[str, int]:
         with self.client.session() as session:
             record = session.run(q.GET_GRAPH_STATS).single()
@@ -255,7 +266,8 @@ class GraphRepository:
             "entity_count": int(record["entity_count"]),
             "relation_count": int(record["relation_count"]),
         }
-        # =====================
+
+    # =====================
     # Entity lookup / resolution
     # =====================
 
@@ -344,6 +356,20 @@ class GraphRepository:
             result = session.run(q.GET_RELATIONS_BY_ENTITY_IDS, params)
             return [self._record_to_relation_view(record) for record in result]
 
+    def get_relations_by_ids(
+        self,
+        relation_ids: list[str],
+    ) -> list[MedicalRelationView]:
+        if not relation_ids:
+            return []
+
+        with self.client.session() as session:
+            result = session.run(
+                q.GET_RELATIONS_BY_IDS,
+                {"relation_ids": relation_ids},
+            )
+            return [self._record_to_relation_view(record) for record in result]
+
     def get_chunks_by_relation_ids(
         self,
         relation_ids: list[str],
@@ -367,20 +393,67 @@ class GraphRepository:
         relation_types: list[str] | None = None,
         max_relations: int = 80,
         max_chunks: int = 50,
+        expand_synonyms: bool = True,
+        max_synonyms: int = 30,
     ) -> EntityContextBundle:
         """
         View gom context cho LightRAG:
-        entity seeds + relations quanh seed + evidence chunks.
+        entity seeds + synonym neighbors + relations quanh tập entity đã mở rộng + evidence chunks.
+
+        DONG_NGHIA_VOI chỉ dùng để mở rộng retrieval, không đổi entity_id/canonical name.
         """
-        entities = self.get_entities_by_ids(entity_ids)
+        expanded_entity_ids = list(dict.fromkeys(entity_ids))
+
+        if expand_synonyms:
+            synonym_entities = self.get_synonym_neighbors(
+                entity_ids=expanded_entity_ids,
+                limit=max_synonyms,
+            )
+            expanded_entity_ids = list(
+                dict.fromkeys(
+                    expanded_entity_ids + [entity.entity_id for entity in synonym_entities]
+                )
+            )
+
+        entities = self.get_entities_by_ids(expanded_entity_ids)
 
         relations = self.get_relations_by_entity_ids(
-            entity_ids=entity_ids,
+            entity_ids=expanded_entity_ids,
             relation_types=relation_types,
             limit=max_relations,
         )
 
         relation_ids = [r.relation_id for r in relations]
+        chunks = self.get_chunks_by_relation_ids(
+            relation_ids=relation_ids,
+            limit=max_chunks,
+        )
+
+        return EntityContextBundle(
+            entities=entities,
+            relations=relations,
+            chunks=chunks,
+        )
+
+    def get_relation_context_bundle(
+        self,
+        relation_ids: list[str],
+        max_chunks: int = 50,
+    ) -> EntityContextBundle:
+        """
+        Dùng sau khi Qdrant search medical_relations trả relation_ids.
+        Lấy relations + subject/object entities + evidence chunks.
+        """
+        relations = self.get_relations_by_ids(relation_ids)
+
+        entity_ids = []
+        for r in relations:
+            entity_ids.append(r.subject_entity_id)
+            entity_ids.append(r.object_entity_id)
+
+        entity_ids = list(dict.fromkeys(entity_ids))
+        entities = self.get_entities_by_ids(entity_ids)
+
         chunks = self.get_chunks_by_relation_ids(
             relation_ids=relation_ids,
             limit=max_chunks,
@@ -403,7 +476,8 @@ class GraphRepository:
     ) -> list[EntityNode]:
         """
         Seed lookup cho HippoRAG.
-        Cố tình chỉ search name/normalized_name/aliases, không search profile quá rộng.
+        Cố tình chỉ search name/normalized_name/aliases/surface_forms/description,
+        không search relation keywords.
         """
         params = {
             "query_text": query_text.strip().lower(),
@@ -482,6 +556,7 @@ class GraphRepository:
         with self.client.session() as session:
             result = session.run(q.GET_CHUNK_ENTITY_LINKS, params)
             return [self._record_to_chunk_entity_link(record) for record in result]
+
     # =====================
     # Helpers
     # =====================
@@ -505,6 +580,7 @@ class GraphRepository:
             normalized_name=record["normalized_name"],
             entity_type=record["entity_type"],
             aliases=list(record["aliases"] or []),
+            surface_forms=list(record["surface_forms"] or []),
             description=record["description"],
             profile_text=record["profile_text"],
             local_keys=list(record["local_keys"] or []),
@@ -530,7 +606,7 @@ class GraphRepository:
             score=float(record.get("score", 0.0) or 0.0),
             metadata=self._from_json(record["metadata_json"]),
         )
-    
+
     def _record_to_relation_view(self, record) -> MedicalRelationView:
         return MedicalRelationView(
             relation_id=record["relation_id"],
@@ -543,6 +619,9 @@ class GraphRepository:
             object_entity_id=record["object_entity_id"],
             object_name=record["object_name"],
             object_type=record["object_type"],
+
+            description=record["description"],
+            keywords=list(record["keywords"] or []),
 
             evidence_text=record["evidence_text"],
             evidence_chunk_ids=list(record["evidence_chunk_ids"] or []),
@@ -572,49 +651,4 @@ class GraphRepository:
             confidence=float(record["confidence"] or 1.0),
             section=record["section"],
             evidence_text=record["evidence_text"],
-        )
-    
-    def get_relations_by_ids(
-        self,
-        relation_ids: list[str],
-    ) -> list[MedicalRelationView]:
-        if not relation_ids:
-            return []
-
-        with self.client.session() as session:
-            result = session.run(
-                q.GET_RELATIONS_BY_IDS,
-                {"relation_ids": relation_ids},
-            )
-            return [self._record_to_relation_view(record) for record in result]
-        
-    def get_relation_context_bundle(
-        self,
-        relation_ids: list[str],
-        max_chunks: int = 50,
-    ) -> EntityContextBundle:
-        """
-        Dùng sau khi Qdrant search medical_relations trả relation_ids.
-        Lấy relations + subject/object entities + evidence chunks.
-        """
-        relations = self.get_relations_by_ids(relation_ids)
-
-        entity_ids = []
-        for r in relations:
-            entity_ids.append(r.subject_entity_id)
-            entity_ids.append(r.object_entity_id)
-
-        entity_ids = list(dict.fromkeys(entity_ids))
-
-        entities = self.get_entities_by_ids(entity_ids)
-
-        chunks = self.get_chunks_by_relation_ids(
-            relation_ids=relation_ids,
-            limit=max_chunks,
-        )
-
-        return EntityContextBundle(
-            entities=entities,
-            relations=relations,
-            chunks=chunks,
         )

@@ -1,3 +1,5 @@
+import re
+import unicodedata
 from enum import Enum
 
 
@@ -26,6 +28,7 @@ class RelationType(str, Enum):
     CAN_TRANH = "CAN_TRANH"
     CHONG_CHI_DINH = "CHONG_CHI_DINH"
     TUONG_TAC_VOI = "TUONG_TAC_VOI"
+    DONG_NGHIA_VOI = "DONG_NGHIA_VOI"
 
 
 ENTITY_TYPES = {item.value for item in EntityType}
@@ -117,6 +120,11 @@ RELATION_RULES: dict[str, dict[str, set[str]]] = {
             EntityType.YEU_TO_NGOAI_SINH.value,
         },
     },
+    # Validator sẽ enforce thêm: subject_type == object_type.
+    RelationType.DONG_NGHIA_VOI.value: {
+        "subject": set(ENTITY_TYPES),
+        "object": set(ENTITY_TYPES),
+    },
 }
 
 
@@ -134,6 +142,32 @@ BLOCKED_ENTITY_HINTS = {
     "bs.",
     "địa chỉ",
     "copyright",
+    # Schema/generic labels, không phải entity y khoa cụ thể.
+    "doi_tuong",
+    "benh_ly",
+    "bieu_hien_lam_sang",
+    "dấu hiệu",
+    "triệu chứng",
+    "nguyên nhân",
+    "biến chứng",
+    "điều trị",
+    "phòng ngừa",
+    "chẩn đoán",
+}
+
+
+def _normalize_for_match(text: str) -> str:
+    text = text.strip().lower()
+    text = text.replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = text.encode("ascii", "ignore").decode("utf-8")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+_NORMALIZED_BLOCKED_ENTITY_HINTS = {
+    _normalize_for_match(hint)
+    for hint in BLOCKED_ENTITY_HINTS
 }
 
 
@@ -159,4 +193,9 @@ def is_valid_relation_schema(
 
 def looks_like_blocked_entity(name: str) -> bool:
     lowered = name.strip().lower()
-    return any(hint in lowered for hint in BLOCKED_ENTITY_HINTS)
+    normalized = _normalize_for_match(name)
+
+    return any(
+        hint in lowered or hint in normalized
+        for hint in _NORMALIZED_BLOCKED_ENTITY_HINTS
+    )
