@@ -474,6 +474,24 @@ ORDER BY c.chunk_index ASC
 """
 )
 
+GET_ALL_CHUNKS = (
+    """
+MATCH (c:Chunk)
+RETURN
+"""
+    + chunk_return("c", "0.0")
+    + """
+ORDER BY c.article_id ASC, c.chunk_index ASC
+LIMIT $limit
+"""
+)
+
+GET_ENTITY_CHUNK_COUNTS = """
+MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+WHERE e.entity_id IN $entity_ids
+RETURN e.entity_id AS entity_id, count(DISTINCT c) AS chunk_count
+"""
+
 
 # =========================
 # LightRAG-style retrieval
@@ -553,14 +571,14 @@ GET_CHUNKS_BY_RELATION_IDS = (
     """
 MATCH ()-[r:MEDICAL_RELATION]->()
 WHERE r.relation_id IN $relation_ids
-WITH collect(DISTINCT r.evidence_chunk_ids) AS nested_ids
-WITH reduce(all_ids = [], ids IN nested_ids | all_ids + ids) AS chunk_ids
-MATCH (c:Chunk)
-WHERE c.chunk_id IN chunk_ids
+UNWIND coalesce(r.evidence_chunk_ids, []) AS chunk_id
+WITH chunk_id, count(DISTINCT r) AS matched_relation_count
+MATCH (c:Chunk {chunk_id: chunk_id})
 RETURN
 """
-    + chunk_return("c", "0.0")
+    + chunk_return("c", "toFloat(matched_relation_count)")
     + """
+ORDER BY score DESC, c.chunk_index ASC
 LIMIT $limit
 """
 )

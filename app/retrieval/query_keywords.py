@@ -4,7 +4,6 @@ import os
 import re
 from typing import Iterable
 
-from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from app.retrieval.retrieval_models import QueryKeywords
@@ -41,7 +40,15 @@ class QueryKeywordExtractor:
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         self.temperature = temperature
         self.use_llm = use_llm and bool(os.getenv("OPENAI_API_KEY"))
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if self.use_llm else None
+        self.client = None
+        if self.use_llm:
+            try:
+                from openai import OpenAI
+
+                self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            except Exception:
+                self.use_llm = False
+                self.client = None
 
     def extract(self, query: str) -> QueryKeywords:
         query = query.strip()
@@ -95,6 +102,7 @@ Quy tắc:
         intent_map = [
             (("triệu chứng", "biểu hiện", "dấu hiệu"), "triệu chứng"),
             (("nguyên nhân", "vì sao", "tại sao", "yếu tố"), "nguyên nhân"),
+            (("liên quan", "liên quan đến", "liên quan tới", "dị ứng"), "yếu tố liên quan"),
             (("biến chứng", "nguy hiểm"), "biến chứng"),
             (("chẩn đoán", "xét nghiệm", "phân biệt"), "chẩn đoán"),
             (("điều trị", "chữa", "thuốc", "bôi", "uống"), "điều trị"),
@@ -126,6 +134,7 @@ Quy tắc:
         # Cắt bớt intent phrase phổ biến để giữ entity phrase.
         patterns = [
             r"\b(có|gồm|là|bao gồm|như thế nào|gì|nào|không)\b",
+            r"\b(liên quan đến|liên quan tới|liên quan|đến|tới)\b",
             r"\b(triệu chứng|biểu hiện|dấu hiệu|nguyên nhân|yếu tố|biến chứng|điều trị|chẩn đoán|phòng ngừa|cần tránh|phân loại)\b",
         ]
         cleaned = text.lower()
@@ -134,7 +143,7 @@ Quy tắc:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
         # Giữ cụm 2-6 token có vẻ là entity.
-        chunks = re.split(r"[,;:/]|\bvà\b|\bhay\b|\bhoặc\b", cleaned)
+        chunks = re.split(r"[,;:/]|\bvà\b|\bhay\b|\bhoặc\b|\bliên quan đến\b|\bliên quan tới\b", cleaned)
         result = [c.strip() for c in chunks if 2 <= len(c.strip()) <= 80]
 
         return [x for x in result if x not in stopwords]

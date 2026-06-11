@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.infrastructure.embedding import EmbeddingService
-from app.infrastructure.vector_database import VectorRepository
+from app.infrastructure.vector_database import NAIVE_CHUNK_COLLECTION, VectorRepository
 from app.infrastructure.vector_database.vector_models import VectorSearchResult
 from app.retrieval.retrieval_models import (
+    RetrievalResult,
     RetrievedChunk,
     RetrievedEntity,
     RetrievedRelation,
@@ -25,9 +26,35 @@ class VectorRetriever:
         self,
         vector_repo: VectorRepository,
         embedding_service: EmbeddingService,
+        chunk_collection_name: str = NAIVE_CHUNK_COLLECTION,
+        method_name: str = "vector_naive",
+        vector_text_mode: str = "raw_chunk_text",
     ):
         self.vector_repo = vector_repo
         self.embedding_service = embedding_service
+        self.chunk_collection_name = chunk_collection_name
+        self.method_name = method_name
+        self.vector_text_mode = vector_text_mode
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> RetrievalResult:
+        """Real naive Vector RAG: embed query -> search raw chunk-text vectors."""
+        chunks = self.search_chunks(query=query, top_k=top_k, filters=filters)
+        return RetrievalResult(
+            query=query,
+            method=self.method_name,
+            chunks=chunks,
+            debug={
+                "collection": self.chunk_collection_name,
+                "vector_text_mode": self.vector_text_mode,
+                "top_k": top_k,
+                "filters": filters or {},
+            },
+        )
 
     def search_chunks(
         self,
@@ -36,7 +63,12 @@ class VectorRetriever:
         filters: dict[str, Any] | None = None,
     ) -> list[RetrievedChunk]:
         vector = self._embed(query)
-        results = self.vector_repo.search_chunks(vector, limit=top_k, filters=filters)
+        results = self.vector_repo.search(
+            self.chunk_collection_name,
+            vector,
+            limit=top_k,
+            filters=filters,
+        )
         return [self._chunk_from_result(r) for r in results]
 
     def search_entities(

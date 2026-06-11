@@ -14,6 +14,7 @@ from app.infrastructure.vector_database.qdrant_client import QdrantClientWrapper
 from app.infrastructure.vector_database.vector_collections import (
     ALL_COLLECTIONS,
     CHUNK_COLLECTION,
+    NAIVE_CHUNK_COLLECTION,
     ENTITY_COLLECTION,
     RELATION_COLLECTION,
 )
@@ -75,6 +76,18 @@ class VectorRepository:
 
     def health_check(self) -> bool:
         return self.client.health_check()
+
+    def collection_exists(self, collection_name: str) -> bool:
+        return bool(self.client.client.collection_exists(collection_name))
+
+    def count_points(self, collection_name: str) -> int:
+        if not self.collection_exists(collection_name):
+            return 0
+        result = self.client.client.count(
+            collection_name=collection_name,
+            exact=True,
+        )
+        return int(result.count or 0)
 
     # =====================
     # Generic write/search
@@ -147,6 +160,9 @@ class VectorRepository:
     def upsert_chunk_vectors(self, points: list[VectorPoint]) -> None:
         self.upsert_points(CHUNK_COLLECTION, points)
 
+    def upsert_naive_chunk_vectors(self, points: list[VectorPoint]) -> None:
+        self.upsert_points(NAIVE_CHUNK_COLLECTION, points)
+
     def upsert_entity_vectors(self, points: list[VectorPoint]) -> None:
         self.upsert_points(ENTITY_COLLECTION, points)
 
@@ -160,6 +176,14 @@ class VectorRepository:
         filters: dict[str, Any] | None = None,
     ) -> list[VectorSearchResult]:
         return self.search(CHUNK_COLLECTION, query_vector, limit, filters)
+
+    def search_naive_chunks(
+        self,
+        query_vector: list[float],
+        limit: int = 10,
+        filters: dict[str, Any] | None = None,
+    ) -> list[VectorSearchResult]:
+        return self.search(NAIVE_CHUNK_COLLECTION, query_vector, limit, filters)
 
     def search_entities(
         self,

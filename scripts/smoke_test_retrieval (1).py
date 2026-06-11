@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import dataclasses
 import json
 import os
@@ -149,7 +148,7 @@ def save_json(path: Path, data: Any) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--method", choices=["vector", "vector_naive", "lightrag", "hipporag", "mixed", "all"], default="all")
+    parser.add_argument("--method", choices=["vector", "lightrag", "hipporag", "mixed", "all"], default="all")
     parser.add_argument("--query", action="append", default=None, help="Repeatable custom query.")
     parser.add_argument("--no-llm-keywords", action="store_true", help="Use fallback keyword extractor.")
     parser.add_argument("--chunk-top-k", type=int, default=10)
@@ -160,7 +159,6 @@ def main() -> None:
     parser.add_argument("--hippo-hops", type=int, default=2)
     parser.add_argument("--max-chunks", type=int, default=12)
     parser.add_argument("--output", default="data/tmp/retrieval_smoke/retrieval_results.json")
-    parser.add_argument("--async-mixed", action="store_true", help="Run the mixed branch with concurrent vector/lightrag/hipporag retrieval.")
     args = parser.parse_args()
 
     load_dotenv(PROJECT_ROOT / ".env")
@@ -215,7 +213,7 @@ def main() -> None:
 
     try:
         for query in queries:
-            if args.method in {"vector", "vector_naive", "all"}:
+            if args.method in {"vector", "all"}:
                 result = vector_retriever.retrieve(query, top_k=args.chunk_top_k)
                 print_result(result)
                 records.append(result_to_dict(result))
@@ -231,10 +229,7 @@ def main() -> None:
                 records.append(result_to_dict(result))
 
             if args.method in {"mixed", "all"}:
-                if args.async_mixed:
-                    result = asyncio.run(mixed_retriever.retrieve_async(query))
-                else:
-                    result = mixed_retriever.retrieve(query)
+                result = mixed_retriever.retrieve(query)
                 print_result(result)
                 records.append(result_to_dict(result))
 

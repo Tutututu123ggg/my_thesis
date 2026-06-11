@@ -9,6 +9,7 @@ from app.retrieval.query_keywords import QueryKeywordExtractor
 from app.retrieval.vector_retriever import VectorRetriever
 from app.retrieval.graph_retriever import GraphRetriever
 from app.retrieval.lightrag_retriever import LightRAGRetriever, LightRAGRetrievalConfig
+from app.retrieval.hipporag_retriever import HippoRAGRetriever, HippoRAGRetrievalConfig
 from app.retrieval.hybrid_retriever import HybridRetriever, HybridRetrievalConfig
 
 __all__ = [
@@ -22,6 +23,8 @@ __all__ = [
     "GraphRetriever",
     "LightRAGRetriever",
     "LightRAGRetrievalConfig",
+    "HippoRAGRetriever",
+    "HippoRAGRetrievalConfig",
     "HybridRetriever",
     "HybridRetrievalConfig",
 ]

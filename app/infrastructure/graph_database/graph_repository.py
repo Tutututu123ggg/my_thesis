@@ -301,6 +301,21 @@ class GraphRepository:
             result = session.run(q.GET_CHUNKS_BY_IDS, {"chunk_ids": chunk_ids})
             return [self._record_to_chunk(record) for record in result]
 
+    def get_all_chunks(self, limit: int = 100_000) -> list[ChunkNode]:
+        """Return all chunks for vector backfill scripts. Neo4j remains source of truth."""
+        with self.client.session() as session:
+            result = session.run(q.GET_ALL_CHUNKS, {"limit": int(limit)})
+            return [self._record_to_chunk(record) for record in result]
+
+    def get_entity_chunk_counts(self, entity_ids: list[str]) -> dict[str, int]:
+        """Count distinct chunks mentioning each entity for HippoRAG node specificity."""
+        if not entity_ids:
+            return {}
+
+        with self.client.session() as session:
+            result = session.run(q.GET_ENTITY_CHUNK_COUNTS, {"entity_ids": entity_ids})
+            return {str(record["entity_id"]): int(record["chunk_count"] or 0) for record in result}
+
     # =====================
     # LightRAG-style retrieval views
     # =====================

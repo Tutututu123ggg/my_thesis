@@ -47,6 +47,7 @@ class GraphRetriever:
             relation_types=relation_types,
             max_relations=max_relations,
             max_chunks=max_chunks,
+            expand_synonyms=False,
         )
 
         return RetrievalResult(
@@ -100,19 +101,17 @@ class GraphRetriever:
         )
 
     def _get_synonym_entity_ids(self, entity_ids: list[str]) -> list[str]:
-        if not hasattr(self.graph_repo, "get_synonym_neighbors"):
+        if not hasattr(self.graph_repo, "get_synonym_neighbors") or not entity_ids:
             return []
 
-        result: list[str] = []
-        for entity_id in entity_ids:
-            try:
-                neighbors = self.graph_repo.get_synonym_neighbors(entity_id=entity_id, limit=10)
-            except TypeError:
-                neighbors = self.graph_repo.get_synonym_neighbors(entity_id, 10)
-            except Exception:
-                neighbors = []
-            result.extend([n.entity_id for n in neighbors])
-        return result
+        try:
+            neighbors = self.graph_repo.get_synonym_neighbors(entity_ids=entity_ids, limit=30)
+        except TypeError:
+            neighbors = self.graph_repo.get_synonym_neighbors(entity_ids, 30)
+        except Exception:
+            neighbors = []
+
+        return [n.entity_id for n in neighbors]
 
     def _entity_from_node(self, entity, score: float) -> RetrievedEntity:
         return RetrievedEntity(

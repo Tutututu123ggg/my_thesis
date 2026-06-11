@@ -12,6 +12,7 @@ from app.infrastructure.vector_database.vector_collections import (
     CHUNK_COLLECTION,
     ENTITY_COLLECTION,
     RELATION_COLLECTION,
+    NAIVE_CHUNK_COLLECTION,
 )
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "CHUNK_COLLECTION",
     "ENTITY_COLLECTION",
     "RELATION_COLLECTION",
+    "NAIVE_CHUNK_COLLECTION",
     "make_qdrant_point_id",
 ]
