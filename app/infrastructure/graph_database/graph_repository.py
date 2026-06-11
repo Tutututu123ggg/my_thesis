@@ -572,6 +572,68 @@ class GraphRepository:
             result = session.run(q.GET_CHUNK_ENTITY_LINKS, params)
             return [self._record_to_chunk_entity_link(record) for record in result]
 
+
+    # =====================
+    # LightRAG keyword maintenance
+    # =====================
+
+    def list_entities_for_lightrag_keyword_regen(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[EntityNode, list[str]]]:
+        """Return entities with a few mention evidence snippets for keyword regeneration."""
+        with self.client.session() as session:
+            result = session.run(
+                q.LIST_ENTITIES_FOR_LIGHTRAG_KEYWORD_REGEN,
+                {"limit": int(limit), "offset": int(offset)},
+            )
+            rows: list[tuple[EntityNode, list[str]]] = []
+            for record in result:
+                rows.append((self._record_to_entity(record), list(record.get("evidence_texts") or [])))
+            return rows
+
+    def list_relations_for_lightrag_keyword_regen(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[MedicalRelationView]:
+        """Return relation views for index-time LightRAG keyword regeneration."""
+        with self.client.session() as session:
+            result = session.run(
+                q.LIST_RELATIONS_FOR_LIGHTRAG_KEYWORD_REGEN,
+                {"limit": int(limit), "offset": int(offset)},
+            )
+            return [self._record_to_relation_view(record) for record in result]
+
+    def update_entity_lightrag_profile(
+        self,
+        entity_id: str,
+        profile_text: str,
+        local_keys: list[str],
+        global_keys: list[str],
+    ) -> None:
+        params = {
+            "entity_id": entity_id,
+            "profile_text": profile_text or "",
+            "local_keys": local_keys or [],
+            "global_keys": global_keys or [],
+        }
+        with self.client.session() as session:
+            session.run(q.UPDATE_ENTITY_LIGHTRAG_PROFILE, params)
+
+    def update_relation_lightrag_keywords(
+        self,
+        relation_id: str,
+        keywords: list[str],
+    ) -> None:
+        params = {
+            "relation_id": relation_id,
+            "keywords": keywords or [],
+        }
+        with self.client.session() as session:
+            session.run(q.UPDATE_RELATION_LIGHTRAG_KEYWORDS, params)
+
     # =====================
     # Helpers
     # =====================

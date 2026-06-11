@@ -1,6 +1,91 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
 from app.evaluation.models import EvaluationQuestion
+
+
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def load_evaluation_questions(path: str | Path) -> list[EvaluationQuestion]:
+    """Load benchmark questions from a JSON file.
+
+    Supported input schemas:
+    - list[dict] with fields from the 100-question benchmark:
+      id, difficulty, question, reference_answer, expected_entities,
+      expected_answer_points, expected_relations, source_links, etc.
+    - list[dict] with the internal fields: question, reference,
+      expected_terms, difficulty, metadata.
+    - dict containing one of: questions, items, data.
+    """
+    path = Path(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    if isinstance(data, dict):
+        for key in ("questions", "items", "data"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+        else:
+            raise ValueError(
+                f"Unsupported dataset object in {path}. Expected a list or a dict with questions/items/data."
+            )
+
+    if not isinstance(data, list):
+        raise ValueError(f"Unsupported dataset format in {path}. Expected a JSON array.")
+
+    questions: list[EvaluationQuestion] = []
+    for idx, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"Invalid item #{idx} in {path}: expected object, got {type(item).__name__}")
+
+        question = str(item.get("question", "")).strip()
+        if not question:
+            raise ValueError(f"Invalid item #{idx} in {path}: missing question")
+
+        reference = str(
+            item.get("reference")
+            or item.get("reference_answer")
+            or item.get("expected_answer")
+            or ""
+        ).strip()
+
+        # Retrieval-only metrics should focus on disease/entity targets, not every
+        # symptom word. Prefer expected_entities from the benchmark, and fall back
+        # to explicit expected_terms only for older small sets.
+        expected_terms = _as_list(item.get("expected_terms"))
+        if not expected_terms:
+            expected_terms = _as_list(item.get("expected_entities"))
+
+        metadata = {
+            k: v
+            for k, v in item.items()
+            if k not in {"question", "reference", "reference_answer", "expected_answer", "expected_terms"}
+        }
+        metadata.setdefault("dataset_file", str(path))
+        metadata.setdefault("row_index", idx)
+
+        questions.append(
+            EvaluationQuestion(
+                question=question,
+                reference=reference,
+                difficulty=str(item.get("difficulty", "unknown")),
+                expected_terms=expected_terms,
+                metadata=metadata,
+            )
+        )
+
+    return questions
 
 
 SMALL_MEDICAL_EVAL_SET: list[EvaluationQuestion] = [

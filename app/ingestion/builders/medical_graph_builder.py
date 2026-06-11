@@ -13,6 +13,7 @@ from app.ingestion.resolution import (
     ResolvedEntity,
     make_relation_id,
 )
+from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
 
 
 class MedicalGraphBuilder:
@@ -30,6 +31,9 @@ class MedicalGraphBuilder:
     ):
         self.graph_repo = graph_repo
         self.resolver = resolver
+        # Deterministic LightRAG index-time keyword normalizer.
+        # Relation keywords are global/theme keys; subject/object names are already stored separately.
+        self.keyword_profiles = KeywordProfileGenerator(llm_client=None)
 
     def write_chunk_extraction(
         self,
@@ -99,13 +103,23 @@ class MedicalGraphBuilder:
                 object_entity_id=object_.entity_id,
             )
 
+            keyword_profile = self.keyword_profiles.generate_relation_profile(
+                relation_type=relation.relation_type,
+                subject_name=subject.name,
+                subject_type=subject.entity_type,
+                object_name=object_.name,
+                object_type=object_.entity_type,
+                description=relation.description,
+                evidence_text=relation.evidence_text,
+            )
+
             medical_relation = MedicalRelation(
                 relation_id=relation_id,
                 subject_entity_id=subject.entity_id,
                 object_entity_id=object_.entity_id,
                 relation_type=relation.relation_type,
                 description=relation.description,
-                keywords=relation.keywords,
+                keywords=keyword_profile.keywords,
                 evidence_text=relation.evidence_text,
                 evidence_chunk_ids=[chunk.chunk_id],
                 confidence=relation.confidence,
@@ -114,6 +128,8 @@ class MedicalGraphBuilder:
                 metadata={
                     "subsection": chunk.subsection,
                     "title": chunk.title,
+                    "original_llm_keywords": relation.keywords,
+                    "keyword_policy": "lightrag_global_relation_keywords",
                 },
             )
 

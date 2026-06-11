@@ -45,7 +45,7 @@ class LLMExtractedRelation(BaseModel):
     )
     keywords: list[str] = Field(
         default_factory=list,
-        description="2-5 keywords ngắn phục vụ relation retrieval.",
+        description="4-8 LightRAG-style keywords, gồm cả low-level/local và high-level/global nếu evidence đủ thông tin.",
     )
     evidence_text: str = Field(
         description="Đoạn bằng chứng ngắn từ chunk chứng minh relation."

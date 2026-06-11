@@ -10,6 +10,7 @@ from app.infrastructure.vector_database import (
 from app.ingestion.extraction import ExtractedEntity, ExtractedGraph, ExtractedRelation
 from app.ingestion.processing import ChunkDocument
 from app.ingestion.resolution import EntityResolver, ResolvedEntity, make_relation_id
+from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
 
 
 class VectorGraphBuilder:
@@ -38,6 +39,7 @@ class VectorGraphBuilder:
         self.embedder = embedder
         self.resolver = resolver
         self.batch_size = batch_size
+        self.keyword_profiles = KeywordProfileGenerator(llm_client=None)
 
     def setup_collections(self, recreate: bool = False) -> None:
         self.vector_repo.setup_collections(recreate=recreate)
@@ -167,7 +169,19 @@ class VectorGraphBuilder:
                     aliases=entity.aliases,
                     surface_forms=entity.surface_forms,
                     description=entity.description,
-                    profile_text=entity.description,
+                    profile_text=self._entity_vector_text(entity),
+                    local_keys=self.keyword_profiles.fallback_entity_profile(
+                        name=entity.name,
+                        entity_type=entity.entity_type,
+                        description=entity.description,
+                        surface_forms=entity.surface_forms,
+                    ).local_keys,
+                    global_keys=self.keyword_profiles.fallback_entity_profile(
+                        name=entity.name,
+                        entity_type=entity.entity_type,
+                        description=entity.description,
+                        surface_forms=entity.surface_forms,
+                    ).global_keys,
                 ).model_dump(),
             )
             for entity, vector in zip(entities, vectors, strict=True)
@@ -201,6 +215,16 @@ class VectorGraphBuilder:
                 object_entity_id=object_.entity_id,
             )
 
+            keyword_profile = self.keyword_profiles.generate_relation_profile(
+                relation_type=relation.relation_type,
+                subject_name=subject.name,
+                subject_type=subject.entity_type,
+                object_name=object_.name,
+                object_type=object_.entity_type,
+                description=relation.description,
+                evidence_text=relation.evidence_text,
+            )
+
             relation_payloads.append(
                 RelationVectorPayload(
                     relation_id=relation_id,
@@ -212,7 +236,7 @@ class VectorGraphBuilder:
                     object_name=object_.name,
                     object_type=object_.entity_type,
                     description=relation.description,
-                    keywords=relation.keywords,
+                    keywords=keyword_profile.keywords,
                     evidence_text=relation.evidence_text,
                     evidence_chunk_ids=[chunk.chunk_id],
                     chunk_id=chunk.chunk_id,
@@ -268,13 +292,13 @@ class VectorGraphBuilder:
         return chunk.contextualized_text or chunk.text
 
     def _entity_vector_text(self, entity: ResolvedEntity) -> str:
-        parts = [
-            f"Tên thực thể: {entity.name}",
-            f"Loại thực thể: {entity.entity_type}",
-        ]
-
-        if entity.description:
-            parts.append(f"Mô tả: {entity.description}")
+        profile = self.keyword_profiles.fallback_entity_profile(
+            name=entity.name,
+            entity_type=entity.entity_type,
+            description=entity.description,
+            surface_forms=entity.surface_forms,
+        )
+        parts = [profile.profile_text]
 
         if entity.surface_forms:
             parts.append("Cách gọi trong văn bản: " + "; ".join(entity.surface_forms[:8]))
@@ -283,7 +307,7 @@ class VectorGraphBuilder:
         if entity.aliases:
             parts.append("Aliases metadata: " + "; ".join(entity.aliases[:8]))
 
-        return "\n".join(parts)
+        return "\n".join([p for p in parts if p])
 
     def _relation_vector_text(self, relation: RelationVectorPayload) -> str:
         parts = [

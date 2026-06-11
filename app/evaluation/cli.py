@@ -7,7 +7,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from app.evaluation.datasets import SMALL_MEDICAL_EVAL_SET
+from app.evaluation.datasets import SMALL_MEDICAL_EVAL_SET, load_evaluation_questions
 from app.evaluation.judge import RagasStyleEvaluator
 from app.evaluation.models import EvaluationConfig
 from app.evaluation.retriever_factory import RetrieverBuildConfig, build_retriever_bundle
@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", choices=["vector", "vector_naive", "lightrag", "hipporag", "mixed"], default=["vector_naive", "lightrag", "hipporag", "mixed"])
     parser.add_argument("--no-llm-keywords", action="store_true")
     parser.add_argument("--async-mixed", action="store_true")
+    parser.add_argument("--dataset-file", default="", help="Path to a benchmark JSON file. If omitted, uses the built-in small set.")
     parser.add_argument("--max-questions", type=int, default=0)
     parser.add_argument("--max-contexts", type=int, default=5)
     parser.add_argument("--chunk-top-k", type=int, default=10)
@@ -109,8 +110,14 @@ async def main_async() -> None:
         config=config,
     )
 
+    dataset = (
+        load_evaluation_questions(PROJECT_ROOT / args.dataset_file)
+        if args.dataset_file
+        else SMALL_MEDICAL_EVAL_SET
+    )
+
     try:
-        rows = await service.run(SMALL_MEDICAL_EVAL_SET)
+        rows = await service.run(dataset)
         service.save(rows, PROJECT_ROOT / args.output_dir)
         for row in rows:
             score = row.evaluation.ragas_style_overall if row.evaluation else 0

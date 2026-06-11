@@ -57,15 +57,19 @@ Không tạo DONG_NGHIA_VOI.
 
 RELATION_KEYWORD_RULES = """
 Quy tắc relation keywords:
-- Mỗi relation nên có 2-5 keywords nếu có evidence_text.
+- tách keyword thành hai tầng:
+  1) low-level/local keywords: entity cụ thể, tên gọi, chi tiết cụ thể, triệu chứng/yếu tố/vị trí cụ thể (Ví dụ: "hen phế quản dị ứng", "thở khò khè", "bụi", "phấn hoa", "da đầu".).
+  2) high-level/global keywords: chủ đề, khái niệm bao quát, theme hoặc intent rộng của quan hệ. Ví dụ: "triệu chứng hô hấp", "yếu tố dị ứng", "chẩn đoán phân biệt bệnh da", "biến chứng nhiễm trùng".
+- Trong schema này, low-level/local information đã nằm ở entity subject/object và evidence_text, ở chung trường relation.keywords.
+- Mỗi relation nên có 2-5 keywords mỗi loại thể hiện chủ đề của relation nếu phù hợp evidence_text.
 - Không nên để keywords rỗng.
 - Keywords phải ngắn, không phải câu dài.
-- Keywords nên gồm subject keyphrase, object keyphrase, relation intent phrase.
 
 Ví dụ:
-CO_BIEU_HIEN: ["viêm da cơ địa", "ngứa", "triệu chứng"]
-DONG_NGHIA_VOI: ["bệnh vảy nến", "psoriasis", "tên tiếng Anh"]
-LA_DANG_CUA: ["vảy nến thể giọt", "bệnh vảy nến", "phân loại"]
+- "hen phế quản dị ứng" CO_BIEU_HIEN "thở khò khè" - evidence_text: "Người bệnh hen phế quản dị ứng có thể thở khò khè, ho và khó thở."
+  -> keywords: ["hen phế quản dị ứng", "thở khò khè", "ho", "khó thở", "triệu chứng hô hấp", "biểu hiện lâm sàng", "gợi ý bệnh từ triệu chứng"] (4 cái đầu là low-level, 3 cái sau high-level)
+- "viêm da cơ địa" GAY_BIEN_CHUNG "nhiễm trùng da" - evidence_text: "Da có thể bị tổn thương do gãi nhiều, làm tăng nguy cơ nhiễm vi khuẩn và vi rút."
+  -> keywords: ["viêm da cơ địa", "nhiễm trùng da", "gãi", "vi khuẩn", "vi rút", "biến chứng", "tổn thương da", "nhiễm trùng da"] (5 cái đầu là low-level, 3 cái sau high-level)
 """.strip()
 
 

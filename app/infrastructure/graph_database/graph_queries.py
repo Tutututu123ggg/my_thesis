@@ -654,3 +654,53 @@ RETURN
     m.evidence_text AS evidence_text
 LIMIT $limit
 """
+# =========================
+# LightRAG keyword maintenance
+# =========================
+
+LIST_ENTITIES_FOR_LIGHTRAG_KEYWORD_REGEN = (
+    """
+MATCH (e:Entity)
+OPTIONAL MATCH (c:Chunk)-[m:MENTIONS]->(e)
+WITH e, collect(DISTINCT coalesce(m.evidence_text, '')) AS evidence_texts
+RETURN
+"""
+    + entity_return("e", "0.0")
+    + """,
+    [x IN evidence_texts WHERE x <> ''][0..5] AS evidence_texts
+ORDER BY e.entity_type ASC, e.name ASC
+SKIP $offset
+LIMIT $limit
+"""
+)
+
+LIST_RELATIONS_FOR_LIGHTRAG_KEYWORD_REGEN = (
+    """
+MATCH (s:Entity)-[r:MEDICAL_RELATION]->(o:Entity)
+RETURN
+"""
+    + relation_return(score="0.0")
+    + """
+ORDER BY r.relation_type ASC, s.name ASC, o.name ASC
+SKIP $offset
+LIMIT $limit
+"""
+)
+
+UPDATE_ENTITY_LIGHTRAG_PROFILE = """
+MATCH (e:Entity {entity_id: $entity_id})
+SET
+    e.profile_text = $profile_text,
+    e.local_keys = $local_keys,
+    e.global_keys = $global_keys,
+    e.updated_in_neo4j_at = datetime()
+RETURN e.entity_id AS entity_id
+"""
+
+UPDATE_RELATION_LIGHTRAG_KEYWORDS = """
+MATCH ()-[r:MEDICAL_RELATION {relation_id: $relation_id}]->()
+SET
+    r.keywords = $keywords,
+    r.updated_in_neo4j_at = datetime()
+RETURN r.relation_id AS relation_id
+"""

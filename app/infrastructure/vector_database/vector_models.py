@@ -51,6 +51,8 @@ class EntityVectorPayload(BaseModel):
     surface_forms: list[str] = Field(default_factory=list)
     description: str | None = None
     profile_text: str | None = None
+    local_keys: list[str] = Field(default_factory=list)
+    global_keys: list[str] = Field(default_factory=list)
 
 
 class RelationVectorPayload(BaseModel):

@@ -205,11 +205,17 @@ def looks_like_question_only(evidence_text: str) -> bool:
 
 
 def make_fallback_keywords(relation: ExtractedRelation) -> list[str]:
+    """Fallback LightRAG-style mixed-level relation keywords.
+
+    LightRAG uses low-level/local keywords for concrete details and high-level/global
+    keywords for broader themes. When the LLM omits keywords, keep a small safe mix:
+    subject/object as concrete retrieval signals plus the relation intent as a broad signal.
+    """
     intent = RELATION_INTENT_KEYWORDS.get(
         relation.relation_type,
         relation.relation_type.lower(),
     )
-    return clean_keywords([relation.subject, relation.object, intent], limit=5)
+    return clean_keywords([relation.subject, relation.object, intent], limit=10)
 
 
 class ExtractionValidator:
@@ -374,7 +380,7 @@ class ExtractionValidator:
                 object=object_,
                 object_type=object_type,
                 description=clean_short_text(relation.description, max_chars=500),
-                keywords=clean_keywords(relation.keywords, limit=5),
+                keywords=clean_keywords(relation.keywords, limit=8),
                 evidence_text=evidence_text,
                 confidence=float(relation.confidence),
             )
