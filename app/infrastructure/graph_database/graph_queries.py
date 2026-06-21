@@ -492,6 +492,37 @@ WHERE e.entity_id IN $entity_ids
 RETURN e.entity_id AS entity_id, count(DISTINCT c) AS chunk_count
 """
 
+GET_CHUNKS_BY_ARTICLE_IDS = (
+    """
+MATCH (c:Chunk)
+WHERE c.article_id IN $article_ids
+RETURN
+"""
+    + chunk_return("c", "0.0")
+    + """
+ORDER BY c.article_id ASC, c.chunk_index ASC
+LIMIT $limit
+"""
+)
+
+GET_ADJACENT_CHUNKS_BY_CHUNK_IDS = (
+    """
+MATCH (seed:Chunk)
+WHERE seed.chunk_id IN $chunk_ids
+MATCH (c:Chunk {article_id: seed.article_id})
+WHERE c.chunk_id <> seed.chunk_id
+  AND abs(coalesce(c.chunk_index, 0) - coalesce(seed.chunk_index, 0)) <= $window
+WITH DISTINCT c, min(abs(coalesce(c.chunk_index, 0) - coalesce(seed.chunk_index, 0))) AS distance
+RETURN
+"""
+    + chunk_return("c", "0.0")
+    + """,
+    distance AS adjacent_distance
+ORDER BY distance ASC, c.article_id ASC, c.chunk_index ASC
+LIMIT $limit
+"""
+)
+
 
 # =========================
 # LightRAG-style retrieval

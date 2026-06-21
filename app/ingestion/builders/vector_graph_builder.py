@@ -9,6 +9,10 @@ from app.infrastructure.vector_database import (
 )
 from app.ingestion.extraction import ExtractedEntity, ExtractedGraph, ExtractedRelation
 from app.ingestion.processing import ChunkDocument
+from app.ingestion.extraction.keyword_profiler import (
+    clean_retrieval_keywords,
+    deterministic_relation_keywords,
+)
 from app.ingestion.resolution import EntityResolver, ResolvedEntity, make_relation_id
 from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
 
@@ -79,6 +83,41 @@ class VectorGraphBuilder:
         self.vector_repo.upsert_chunk_vectors(points)
         return len(points)
 
+    def upsert_naive_chunks(self, chunks: list[ChunkDocument]) -> int:
+        """Write the true vector_naive baseline: embeddings from raw chunk.text only."""
+        if not chunks:
+            return 0
+
+        texts = [chunk.text for chunk in chunks]
+        vectors = self.embedder.embed_texts(texts, batch_size=self.batch_size)
+
+        points = [
+            VectorPoint(
+                point_id=make_qdrant_point_id(f"naive_chunk::{chunk.chunk_id}"),
+                vector=vector,
+                payload=ChunkVectorPayload(
+                    chunk_id=chunk.chunk_id,
+                    article_id=chunk.article_id,
+                    source_url=chunk.source_url,
+                    title=chunk.title,
+                    section=chunk.section,
+                    subsection=chunk.subsection,
+                    chunk_index=chunk.chunk_index,
+                    token_count=chunk.token_count,
+                    text=chunk.text,
+                    contextualized_text=chunk.text,
+                    metadata={
+                        **dict(chunk.metadata or {}),
+                        "vector_text_mode": "raw_chunk_text",
+                    },
+                ).model_dump(),
+            )
+            for chunk, vector in zip(chunks, vectors, strict=True)
+        ]
+
+        self.vector_repo.upsert_naive_chunk_vectors(points)
+        return len(points)
+
     # =====================
     # Entity/relation vectors: LightRAG-style vector lookup
     # =====================
@@ -94,6 +133,15 @@ class VectorGraphBuilder:
         Hàm này không ghi Neo4j. Nếu cần ghi cả graph + vector, hãy gọi
         MedicalGraphBuilder.write_chunk_extraction() trước, rồi gọi hàm này.
         """
+        if not extracted_graph.should_ingest_graph:
+            return {
+                "chunk_id": chunk.chunk_id,
+                "entity_vector_count": 0,
+                "relation_vector_count": 0,
+                "skipped_graph_vector_ingest": True,
+                "skip_reason": extracted_graph.skip_reason,
+            }
+
         resolved_by_key = self._resolve_entities(extracted_graph.entities)
 
         entity_points = self._build_entity_points(resolved_by_key.values())
@@ -113,6 +161,8 @@ class VectorGraphBuilder:
             "chunk_id": chunk.chunk_id,
             "entity_vector_count": len(entity_points),
             "relation_vector_count": len(relation_points),
+            "skipped_graph_vector_ingest": False,
+            "skip_reason": None,
         }
 
     def _resolve_entities(
@@ -215,15 +265,9 @@ class VectorGraphBuilder:
                 object_entity_id=object_.entity_id,
             )
 
-            keyword_profile = self.keyword_profiles.generate_relation_profile(
-                relation_type=relation.relation_type,
-                subject_name=subject.name,
-                subject_type=subject.entity_type,
-                object_name=object_.name,
-                object_type=object_.entity_type,
-                description=relation.description,
-                evidence_text=relation.evidence_text,
-            )
+            relation_keywords = clean_retrieval_keywords(relation.keywords, limit=8)
+            if not relation_keywords:
+                relation_keywords = deterministic_relation_keywords(relation)
 
             relation_payloads.append(
                 RelationVectorPayload(
@@ -236,7 +280,7 @@ class VectorGraphBuilder:
                     object_name=object_.name,
                     object_type=object_.entity_type,
                     description=relation.description,
-                    keywords=keyword_profile.keywords,
+                    keywords=relation_keywords,
                     evidence_text=relation.evidence_text,
                     evidence_chunk_ids=[chunk.chunk_id],
                     chunk_id=chunk.chunk_id,

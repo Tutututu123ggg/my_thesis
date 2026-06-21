@@ -6,6 +6,8 @@ from typing import Iterable
 
 from pydantic import BaseModel, Field
 
+from app.domain.medical_schema import ENTITY_TYPES, RELATION_TYPES
+
 
 class EntityLightRAGProfile(BaseModel):
     """Index-time entity profile used by LightRAG-style entity retrieval."""
@@ -104,6 +106,7 @@ class KeywordProfileGenerator:
             proposed.global_keys,
             limit=self.max_entity_global_keys,
             local_keys=local_keys,
+            schema_values=[entity_type],
         )
         if not global_keys:
             global_keys = fallback.global_keys
@@ -169,6 +172,7 @@ class KeywordProfileGenerator:
             relation_type=relation_type,
             subject_name=subject_name,
             object_name=object_name,
+            schema_values=[relation_type, subject_type, object_type],
         )
         return RelationLightRAGProfile(keywords=keywords or fallback.keywords)
 
@@ -191,13 +195,15 @@ class KeywordProfileGenerator:
             self.max_entity_local_keys,
             support_text=support_text,
         )
+        # Do not derive global keys from entity_type. Schema labels such as
+        # BENH_LY/BIEU_HIEN_LAM_SANG are implementation metadata, not
+        # LightRAG natural-language topic keys. Fallback global keys are mined
+        # only from available description/evidence text.
         global_keys = self._clean_global_entity_keys(
-            [
-                *self._entity_type_global_keys(entity_type),
-                *self._semantic_hints_from_text(" ".join([description or "", *(evidence_texts or [])])),
-            ],
+            self._semantic_hints_from_text(" ".join([description or "", *(evidence_texts or [])])),
             self.max_entity_global_keys,
             local_keys=local,
+            schema_values=[entity_type],
         )
         return EntityLightRAGProfile(
             profile_text=self._build_entity_profile_text(
@@ -223,12 +229,12 @@ class KeywordProfileGenerator:
         description: str | None = None,
         evidence_text: str | None = None,
     ) -> RelationLightRAGProfile:
-        # Fallback is intentionally simple and mixed-level: endpoints are
-        # low-level retrieval signals; the relation type and semantic hints are
-        # high-level/global signals. In normal regeneration, the LLM output is
-        # preferred and this fallback is only used when the LLM fails.
+        # Fallback is intentionally simple and data-derived: endpoints are
+        # low-level retrieval signals; text-mined n-grams are weak
+        # global/detail signals. Do not add relation_type itself, because schema
+        # enums such as CO_BIEU_HIEN/DIEU_TRI_BANG are not LightRAG natural
+        # language topic keys.
         keywords = [subject_name, object_name]
-        keywords.extend(RELATION_TYPE_KEYWORDS.get(relation_type, [self._humanize_relation_type(relation_type)]))
         keywords.extend(
             self._semantic_hints_from_relation(
                 relation_type=relation_type,
@@ -246,6 +252,7 @@ class KeywordProfileGenerator:
                 relation_type=relation_type,
                 subject_name=subject_name,
                 object_name=object_name,
+                schema_values=[relation_type, subject_type, object_type],
             )
         )
 
@@ -278,7 +285,9 @@ class KeywordProfileGenerator:
         return "\n".join(parts)
 
     def _entity_type_global_keys(self, entity_type: str) -> list[str]:
-        return ENTITY_TYPE_GLOBAL_KEYS.get(entity_type, [entity_type.lower().replace("_", " ")])
+        # Kept for backward compatibility. Entity schema labels are metadata,
+        # not LightRAG natural-language global keys.
+        return []
 
     def _semantic_hints_from_relation(
         self,
@@ -293,21 +302,33 @@ class KeywordProfileGenerator:
         return self._semantic_hints_from_text(" ".join([subject_name, object_name, text]))
 
     def _semantic_hints_from_text(self, text: str) -> list[str]:
+        """Extract lightweight text-derived hints without domain keyword lists.
+
+        This fallback is used only when no LLM profile is available. It mines
+        repeated/long n-grams from the provided evidence text, instead of using
+        hand-written medical categories such as respiratory/dermatology/allergy.
+        """
         normalized = self._normalize_ascii(text)
-        hints: list[str] = []
-        if any(x in normalized for x in ["kho khe", "kho tho", "ho ", "tuc nguc", "hen", "phoi", "phe quan"]):
-            hints.append("triệu chứng hô hấp")
-            hints.append("bệnh hô hấp")
-        if any(x in normalized for x in ["ngua", "ban do", "da kho", "bong vay", "mun nuoc", "da dau", "khuu tay", "cham", "vay nen"]):
-            hints.append("triệu chứng da")
-            hints.append("bệnh da liễu")
-        if any(x in normalized for x in ["bui", "phan hoa", "long thu", "mat bui", "di nguyen", "di ung", "hoa chat"]):
-            hints.append("yếu tố dị ứng")
-        if any(x in normalized for x in ["virus", "vi khuan", "nhiem trung", "nam"]):
-            hints.append("nhiễm trùng")
-        if any(x in normalized for x in ["tre so sinh", "tre em", "nguoi lon", "phu nu mang thai"]):
-            hints.append("đối tượng nguy cơ")
-        return hints
+        tokens = re.findall(r"[a-z0-9]+", normalized)
+        counts: dict[str, int] = {}
+        first_pos: dict[str, int] = {}
+        for n in range(4, 1, -1):
+            for i in range(0, max(len(tokens) - n + 1, 0)):
+                phrase = " ".join(tokens[i : i + n])
+                if not self._looks_like_keyword(phrase):
+                    continue
+                counts[phrase] = counts.get(phrase, 0) + 1
+                first_pos.setdefault(phrase, i)
+
+        ranked = sorted(
+            counts,
+            key=lambda item: (counts[item], len(item.split()), len(item), -first_pos[item]),
+            reverse=True,
+        )
+        return ranked[:5]
+
+    def _humanize_type(self, value: str) -> str:
+        return (value or "").lower().replace("_", " ")
 
     def _humanize_relation_type(self, relation_type: str) -> str:
         return relation_type.lower().replace("_", " ")
@@ -329,8 +350,6 @@ class KeywordProfileGenerator:
             key = self._normalize_ascii(value)
             if not key or key in seen:
                 continue
-            if key in GENERIC_KEYWORDS:
-                continue
             seen.add(key)
             result.append(value)
             if len(result) >= limit:
@@ -348,7 +367,7 @@ class KeywordProfileGenerator:
             if not value or len(value.split()) > 8:
                 continue
             key = self._normalize_ascii(value)
-            if not key or key in seen or key in GENERIC_KEYWORDS:
+            if not key or key in seen:
                 continue
             # Local keys must be concrete surface forms supported by existing
             # graph text. This blocks hallucinated keys like "xét nghiệm X".
@@ -366,6 +385,7 @@ class KeywordProfileGenerator:
         limit: int,
         *,
         local_keys: Iterable[str] | None = None,
+        schema_values: Iterable[str] | None = None,
     ) -> list[str]:
         """Clean LightRAG high-level/entity-global keywords.
 
@@ -377,6 +397,7 @@ class KeywordProfileGenerator:
         are merely low-level entity names/synonyms.
         """
         local_norms = {self._normalize_ascii(x) for x in (local_keys or []) if x}
+        schema_norms = self._schema_keyword_norms(schema_values)
         result: list[str] = []
         seen: set[str] = set()
         for value in values:
@@ -384,9 +405,9 @@ class KeywordProfileGenerator:
             if not text or len(text.split()) > 8:
                 continue
             key = self._normalize_ascii(text)
-            if not key or key in seen or key in GENERIC_KEYWORDS:
+            if not key or key in seen:
                 continue
-            if key in local_norms:
+            if key in local_norms or key in schema_norms:
                 continue
             # Avoid using a local key wrapped in a trivial phrase as a global
             # theme, e.g. "viêm da cơ địa" or "bệnh viêm da cơ địa".
@@ -406,6 +427,7 @@ class KeywordProfileGenerator:
         relation_type: str,
         subject_name: str,
         object_name: str,
+        schema_values: Iterable[str] | None = None,
     ) -> list[str]:
         """Clean LightRAG relation keywords.
 
@@ -414,6 +436,7 @@ class KeywordProfileGenerator:
         specific terms and broad themes. We only remove empty/duplicate/very
         generic or sentence-like keywords; we do not force a closed vocabulary.
         """
+        schema_norms = self._schema_keyword_norms(schema_values)
         result: list[str] = []
         seen: set[str] = set()
         for item in values:
@@ -421,7 +444,7 @@ class KeywordProfileGenerator:
             if not value or len(value.split()) > 8:
                 continue
             key = self._normalize_ascii(value)
-            if not key or key in seen or key in GENERIC_KEYWORDS:
+            if not key or key in seen or key in schema_norms:
                 continue
             seen.add(key)
             result.append(value)
@@ -430,10 +453,40 @@ class KeywordProfileGenerator:
         return result
 
     def _suggested_relation_keywords(self, relation_type: str) -> list[str]:
-        return [
-            *RELATION_TYPE_KEYWORDS.get(relation_type, []),
-            *DOMAIN_THEME_KEYWORDS,
-        ]
+        # Kept for backward compatibility. Relation schema labels are metadata,
+        # not LightRAG natural-language keyword keys.
+        return []
+
+    def _schema_keyword_norms(self, values: Iterable[str] | None = None) -> set[str]:
+        """Normalized schema labels that must not become retrieval keywords.
+
+        This is a schema-invariant guard, not a medical term blacklist. It only
+        prevents implementation metadata such as BENH_LY or CO_BIEU_HIEN from
+        leaking into LightRAG natural-language keyword vectors.
+        """
+        raw_values = {str(item or "") for item in (values or [])}
+        raw_values.update(str(item or "") for item in ENTITY_TYPES)
+        raw_values.update(str(item or "") for item in RELATION_TYPES)
+
+        norms: set[str] = set()
+        for value in raw_values:
+            value = value.strip()
+            if not value:
+                continue
+            norms.add(self._normalize_ascii(value))
+            norms.add(self._normalize_ascii(value.lower().replace("_", " ")))
+        return {item for item in norms if item}
+
+    def _looks_like_keyword(self, value: str) -> bool:
+        value = self._normalize_ascii(value)
+        if not value or len(value) < 5:
+            return False
+        toks = value.split()
+        if len(toks) > 8:
+            return False
+        if len(toks) == 1:
+            return len(toks[0]) >= 6 or any(ch.isdigit() for ch in toks[0])
+        return any(len(tok) >= 3 or any(ch.isdigit() for ch in tok) for tok in toks)
 
     def _clean_text(self, value: str) -> str:
         value = re.sub(r"\s+", " ", value or "").strip(" -–—:;,.()[]{}\n\t")
@@ -461,95 +514,33 @@ class KeywordProfileGenerator:
             return json.loads(match.group(0))
 
 
-ENTITY_TYPE_GLOBAL_KEYS = {
-    "BENH_LY": ["bệnh và hội chứng"],
-    "BIEU_HIEN_LAM_SANG": ["triệu chứng", "biểu hiện lâm sàng"],
-    "YEU_TO_BENH_SINH": ["nguyên nhân", "cơ chế bệnh sinh", "yếu tố nguy cơ nội tại"],
-    "YEU_TO_NGOAI_SINH": ["yếu tố môi trường", "yếu tố kích hoạt bên ngoài"],
-    "PHUONG_PHAP_CHAN_DOAN": ["chẩn đoán", "xét nghiệm", "phương pháp chẩn đoán"],
-    "CAN_THIEP_Y_TE": ["điều trị", "can thiệp y tế", "chăm sóc"],
-    "THUOC_VA_HOAT_CHAT": ["thuốc", "hoạt chất", "điều trị bằng thuốc"],
-    "VI_TRI_GIAI_PHAU": ["vị trí cơ thể", "vùng tổn thương", "giải phẫu"],
-    "DOI_TUONG": ["nhóm bệnh nhân", "đối tượng nguy cơ"],
-}
-
-DOMAIN_THEME_KEYWORDS = [
-    "triệu chứng hô hấp",
-    "triệu chứng da",
-    "bệnh hô hấp",
-    "bệnh da liễu",
-    "yếu tố dị ứng",
-    "nhiễm trùng",
-    "đối tượng nguy cơ",
-]
-
-RELATION_TYPE_KEYWORDS = {
-    "LA_DANG_CUA": ["phân loại bệnh", "dạng bệnh", "thể bệnh"],
-    "DONG_NGHIA_VOI": ["tên gọi khác", "đồng nghĩa", "thuật ngữ tương đương"],
-    "CHAN_DOAN_PHAN_BIET_VOI": ["chẩn đoán phân biệt", "dễ nhầm với", "phân biệt bệnh"],
-    "CO_BIEU_HIEN": ["triệu chứng", "biểu hiện lâm sàng", "gợi ý bệnh từ triệu chứng"],
-    "LIEN_QUAN_YEU_TO": ["yếu tố liên quan", "yếu tố nguy cơ", "yếu tố kích hoạt"],
-    "GAY_BIEN_CHUNG": ["biến chứng", "dẫn đến", "nguy cơ phát sinh bệnh"],
-    "ANH_HUONG_DEN": ["vị trí ảnh hưởng", "vùng tổn thương", "đối tượng ảnh hưởng"],
-    "CHAN_DOAN_BANG": ["chẩn đoán", "xét nghiệm", "phương pháp chẩn đoán"],
-    "DIEU_TRI_BANG": ["điều trị", "kiểm soát bệnh", "can thiệp điều trị"],
-    "PHONG_NGUA_BANG": ["phòng ngừa", "phòng tránh", "giảm nguy cơ"],
-    "CAN_TRANH": ["cần tránh", "kiêng", "tránh yếu tố kích thích"],
-    "CHONG_CHI_DINH": ["chống chỉ định", "không nên dùng", "cảnh báo điều trị"],
-    "TUONG_TAC_VOI": ["tương tác", "tương tác thuốc", "tương tác hoạt chất"],
-}
-
-GENERIC_KEYWORDS = {
-    "benh ly",
-    "trieu chung benh",
-    "van de",
-    "tinh trang suc khoe",
-    "trieu chung chung",
-}
-
-
 ENTITY_PROFILE_SYSTEM_PROMPT = """
 ---Role---
 Bạn là expert tạo keyword profile cho LightRAG-style graph retrieval trong miền y khoa tiếng Việt.
 
 ---LightRAG Keyword Principle---
-LightRAG dùng hai tầng keyword, giống các ví dụ kiểu biodiversity/environmental consequences:
-- low-level/local keywords: entity cụ thể, tên gọi, thuộc tính/chi tiết cụ thể, thuật ngữ bề mặt.
-- high-level/global keywords: chủ đề, khái niệm bao quát, theme rộng hơn của entity.
+- local_keys: tên entity, surface form, viết tắt, synonym/tên tương đương nếu xuất hiện trong input.
+- global_keys: chủ đề/theme tự nhiên rộng hơn entity, dùng cho retrieval ngữ nghĩa.
+- global_keys không phải schema label, entity type, relation type enum.
 
 ---Task---
-Với ENTITY đã có trong graph, tạo:
-1. profile_text: mô tả ngắn dựa trên input, không thêm fact mới.
-2. local_keys: 2-5 low-level keywords nếu có đủ dữ liệu.
-3. global_keys: 2-5 high-level keywords nếu có đủ dữ liệu.
+Với ENTITY đã có trong graph, tạo JSON:
+{
+  "profile_text": "...",
+  "local_keys": ["..."],
+  "global_keys": ["..."]
+}
 
 ---Rules---
-- Chỉ dùng dữ liệu được cung cấp. Không thêm kiến thức y khoa mới.
-- local_keys nên gồm name, surface_forms, viết tắt, tên tiếng Anh/Latin, synonym/tên tương đương nếu xuất hiện rõ trong input.
-- Không đưa xét nghiệm/điều trị/biến chứng/triệu chứng/yếu tố nguy cơ vào local_keys, trừ khi chính chúng là tên của entity hiện tại.
-- global_keys là theme rộng tự nhiên. Không cần chọn từ vocabulary cố định.
-- global_keys không phải danh sách synonym và không lặp lại local_keys.
-- Tránh keyword vô dụng/quá rộng như "bệnh lý", "vấn đề", "tình trạng sức khỏe".
-- Trả JSON parseable, không markdown, không giải thích.
+- Chỉ dùng dữ liệu được cung cấp, không thêm fact y khoa mới.
+- local_keys không chứa xét nghiệm/điều trị/biến chứng/triệu chứng/yếu tố nguy cơ, trừ khi chính entity hiện tại là khái niệm đó.
+- global_keys là cụm tự nhiên, không lặp lại local_keys, không phải synonym list.
+- Không output schema/enum như BENH_LY, BIEU_HIEN_LAM_SANG, CO_BIEU_HIEN, DIEU_TRI_BANG.
+- Tránh keyword quá rộng như "bệnh lý", "vấn đề", "tình trạng sức khỏe".
+- Keywords ngắn gọn, thường 2-8 từ.
+- Chỉ trả JSON parseable, không markdown, không giải thích.
 
----Few-shot examples---
-Example 1:
-Input:
-{
-  "name": "Asthma",
-  "entity_type": "BENH_LY",
-  "description": "Tên tiếng Anh của bệnh hen suyễn.",
-  "surface_forms": ["Asthma"],
-  "evidence_texts": ["Asthma là tên tiếng Anh của bệnh hen suyễn."]
-}
-Output:
-{
-  "profile_text": "Asthma là tên tiếng Anh của bệnh hen suyễn.",
-  "local_keys": ["Asthma", "hen suyễn"],
-  "global_keys": ["bệnh hô hấp", "bệnh đường thở", "dị ứng hô hấp"]
-}
-
-Example 2:
+---Examples---
 Input:
 {
   "name": "atopic dermatitis",
@@ -565,7 +556,6 @@ Output:
   "global_keys": ["bệnh da liễu", "viêm da mạn tính", "cơ địa dị ứng"]
 }
 
-Example 3:
 Input:
 {
   "name": "thở khò khè",
@@ -576,47 +566,42 @@ Input:
 }
 Output:
 {
-  "profile_text": "thở khò khè là biểu hiện lâm sàng được mô tả trong bệnh hô hấp.",
+  "profile_text": "thở khò khè là triệu chứng được mô tả trong bệnh hô hấp.",
   "local_keys": ["thở khò khè", "khò khè"],
-  "global_keys": ["triệu chứng hô hấp", "biểu hiện lâm sàng", "bệnh đường thở"]
-}
-
----JSON Schema---
-{
-  "profile_text": "...",
-  "local_keys": ["..."],
-  "global_keys": ["..."]
+  "global_keys": ["triệu chứng hô hấp", "triệu chứng bệnh đường thở", "khó thở và khò khè"]
 }
 """.strip()
 
 
 RELATION_PROFILE_SYSTEM_PROMPT = """
 ---Role---
-Bạn là expert tạo keywords cho LightRAG-style graph retrieval trong miền y khoa tiếng Việt.
+Bạn là expert tạo keywords cho LightRAG-style relation retrieval trong miền y khoa tiếng Việt.
 
----LightRAG Keyword Principle---
-LightRAG tách keyword thành hai tầng, giống ví dụ biodiversity:
-- low-level/local keywords: entity cụ thể, tên gọi, chi tiết cụ thể trong relation/evidence.
-- high-level/global keywords: chủ đề, khái niệm bao quát, theme rộng hơn của relation.
+---Principle---
+Relation keywords là một list trộn hai tầng:
+- local keys: subject, object, hoặc chi tiết cụ thể xuất hiện trong evidence_text.
+- global keys: topic/theme tự nhiên của quan hệ, dùng cho relation/global-key retrieval.
 
 ---Task---
-Với RELATION đã có trong graph, tạo một list "keywords" gồm cả hai tầng:
-- 2-5 low-level keywords nếu evidence đủ thông tin.
-- 2-5 high-level keywords nếu evidence đủ thông tin.
-Tổng số keywords nên ngắn gọn, thường 4-8 item.
+Với RELATION đã có trong graph, trả JSON:
+{
+  "keywords": ["..."]
+}
 
 ---Rules---
-- Chỉ dùng input để hiểu quan hệ; không thêm fact y khoa mới.
-- Không cần chọn từ vocabulary cố định. Hãy tạo cụm tự nhiên, đa dạng về ngữ nghĩa.
-- Low-level keywords có thể là subject/object, triệu chứng cụ thể, yếu tố cụ thể, vị trí cụ thể, hoặc chi tiết cụ thể trong evidence.
-- High-level keywords là theme rộng hơn, ví dụ: "triệu chứng hô hấp", "yếu tố môi trường", "bệnh da dị ứng", "chẩn đoán phân biệt bệnh da", "biến chứng nhiễm trùng".
-- Không chỉ trả nhãn schema khô cứng như "CO_BIEU_HIEN" hoặc "LIEN_QUAN_YEU_TO".
+- Mỗi relation nên có 4-8 keywords ngắn.
+- Chỉ dùng input/evidence_text, không thêm fact y khoa mới.
+- Không dùng schema label/entity type/relation enum làm keyword.
+  Ví dụ cấm: BENH_LY, BIEU_HIEN_LAM_SANG, CO_BIEU_HIEN, DIEU_TRI_BANG, GAY_BIEN_CHUNG.
+- Không chỉ dùng facet generic như "triệu chứng", "điều trị", "biến chứng", "chẩn đoán".
+- Nếu có bệnh/entity chính, ưu tiên global key có anchor:
+  "triệu chứng của viêm da cơ địa", "điều trị hen phế quản",
+  "biến chứng của viêm phổi", "yếu tố làm nặng viêm da cơ địa".
 - Không tạo keyword quá dài hoặc thành câu hoàn chỉnh.
-- Trả JSON parseable, không markdown, không giải thích.
+- Chỉ trả JSON parseable, không markdown, không giải thích.
 
----Few-shot examples---
-Example 1:
-Input relation:
+---Examples---
+Input:
 {
   "relation_type": "CO_BIEU_HIEN",
   "subject": {"name": "hen phế quản dị ứng", "entity_type": "BENH_LY"},
@@ -625,11 +610,10 @@ Input relation:
 }
 Output:
 {
-  "keywords": ["hen phế quản dị ứng", "thở khò khè", "ho", "khó thở", "triệu chứng hô hấp", "biểu hiện lâm sàng", "bệnh đường thở"]
+  "keywords": ["hen phế quản dị ứng", "thở khò khè", "ho", "khó thở", "triệu chứng của hen phế quản dị ứng", "triệu chứng hô hấp"]
 }
 
-Example 2:
-Input relation:
+Input:
 {
   "relation_type": "LIEN_QUAN_YEU_TO",
   "subject": {"name": "viêm da cơ địa", "entity_type": "BENH_LY"},
@@ -638,37 +622,18 @@ Input relation:
 }
 Output:
 {
-  "keywords": ["viêm da cơ địa", "bụi", "ô nhiễm", "hóa chất", "yếu tố môi trường", "yếu tố kích hoạt", "bệnh da dị ứng"]
+  "keywords": ["viêm da cơ địa", "bụi", "ô nhiễm", "hóa chất", "yếu tố môi trường làm nặng viêm da cơ địa", "yếu tố kích hoạt bệnh da"]
 }
 
-Example 3:
-Input relation:
-{
-  "relation_type": "CHAN_DOAN_PHAN_BIET_VOI",
-  "subject": {"name": "viêm da tiết bã", "entity_type": "BENH_LY"},
-  "object": {"name": "bệnh vảy nến", "entity_type": "BENH_LY"},
-  "evidence_text": "Viêm da tiết bã dễ nhầm lẫn với các bệnh như viêm da cơ địa hoặc vảy nến da đầu."
-}
-Output:
-{
-  "keywords": ["viêm da tiết bã", "bệnh vảy nến", "vảy nến da đầu", "viêm da cơ địa", "chẩn đoán phân biệt", "phân biệt bệnh da liễu", "bệnh da bong vảy"]
-}
-
-Example 4:
-Input relation:
+Input:
 {
   "relation_type": "GAY_BIEN_CHUNG",
-  "subject": {"name": "viêm da cơ địa", "entity_type": "BENH_LY"},
-  "object": {"name": "nhiễm trùng da", "entity_type": "BENH_LY"},
-  "evidence_text": "Da có thể bị tổn thương do gãi nhiều, làm tăng nguy cơ nhiễm vi khuẩn và vi rút."
+  "subject": {"name": "viêm phổi", "entity_type": "BENH_LY"},
+  "object": {"name": "suy hô hấp", "entity_type": "BENH_LY"},
+  "evidence_text": "Viêm phổi nặng có thể dẫn đến suy hô hấp."
 }
 Output:
 {
-  "keywords": ["viêm da cơ địa", "nhiễm trùng da", "gãi nhiều", "vi khuẩn", "vi rút", "biến chứng", "tổn thương da"]
-}
-
----JSON Schema---
-{
-  "keywords": ["...", "..."]
+  "keywords": ["viêm phổi", "suy hô hấp", "viêm phổi nặng", "biến chứng của viêm phổi", "diễn tiến viêm phổi gây suy hô hấp", "biến chứng hô hấp nặng"]
 }
 """.strip()

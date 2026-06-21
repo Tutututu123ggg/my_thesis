@@ -50,12 +50,58 @@ class ChatLLMClient:
         )
 
     def _generate_openai(self, system_prompt: str, user_prompt: str) -> str:
+        import os
+
+        import httpx
         from openai import OpenAI
 
-        client = OpenAI(
-            api_key=self.config.api_key or os.getenv("OPENAI_API_KEY"),
-            base_url=self.config.base_url or os.getenv("OPENAI_BASE_URL") or None,
+        api_key = (self.config.api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+        base_url = (self.config.base_url or os.getenv("OPENAI_BASE_URL") or "").strip() or None
+
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is empty.")
+
+        if "\n" in api_key or "\r" in api_key:
+            raise RuntimeError("OPENAI_API_KEY contains newline characters.")
+
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key.split(" ", 1)[1].strip()
+
+        if len(api_key) > 512:
+            raise RuntimeError(
+                f"OPENAI_API_KEY looks too long ({len(api_key)} chars). "
+                "Check .env and Windows environment variables."
+            )
+
+        # Force-remove optional OpenAI env vars that the SDK may send as headers.
+        # A broken/huge org/project env value can trigger:
+        # 431 Request headers are too large.
+        for name in [
+            "OPENAI_ORG_ID",
+            "OPENAI_ORGANIZATION",
+            "OPENAI_PROJECT",
+            "OPENAI_PROJECT_ID",
+        ]:
+            os.environ.pop(name, None)
+
+        # trust_env=False prevents httpx/OpenAI SDK from inheriting huge/broken
+        # HTTP_PROXY/HTTPS_PROXY/ALL_PROXY or other environment-level transport config.
+        http_client = httpx.Client(
+            timeout=60.0,
+            trust_env=False,
         )
+
+        client_kwargs = {
+            "api_key": api_key,
+            "organization": None,
+            "project": None,
+            "http_client": http_client,
+        }
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        client = OpenAI(**client_kwargs)
+
         response = client.chat.completions.create(
             model=self.config.model,
             messages=[

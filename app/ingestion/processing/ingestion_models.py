@@ -32,6 +32,7 @@ class SectionDocument(BaseModel):
     section_title: str
     section_level: int
     parent_section_title: str | None = None
+    heading_path: list[str] = Field(default_factory=list)
 
     text: str
     order: int
@@ -46,6 +47,7 @@ class ChunkDocument(BaseModel):
     section: str | None = None
     subsection: str | None = None
     chunk_index: int
+    heading_path: list[str] = Field(default_factory=list)
 
     text: str
     contextualized_text: str

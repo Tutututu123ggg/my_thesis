@@ -51,7 +51,6 @@ desktop.ini
 logs/
 data/logs/*
 !data/logs/.gitkeep
-
 # =========================
 # Data files - ignore generated/heavy data
 # =========================

@@ -4,10 +4,12 @@ import asyncio
 import csv
 import dataclasses
 import json
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from app.evaluation.judge import RagasStyleEvaluator, normalize_text
 from app.infrastructure.vector_database import NAIVE_CHUNK_COLLECTION
@@ -64,10 +66,16 @@ class MedicalRAGEvaluationService:
             item.question,
             result,
         )
-        contexts = [
-            build_clean_chunk_context([chunk], max_chunks=1)
-            for chunk in result.chunks[: self.config.max_context_chunks]
-        ]
+        # Use the exact context chunks seen by the answer generator when
+        # sentence-level evidence selection is enabled. Retrieval metrics below
+        # still use the original retrieval result, so Source@K/Term@K remain
+        # comparable across methods.
+        contexts = (generated.context_chunks or [])[: self.config.max_context_chunks]
+        if not contexts:
+            contexts = [
+                build_clean_chunk_context([chunk], max_chunks=1)
+                for chunk in result.chunks[: self.config.max_context_chunks]
+            ]
         judgement = await asyncio.to_thread(
             self.evaluator.evaluate,
             item.question,
@@ -75,6 +83,7 @@ class MedicalRAGEvaluationService:
             generated.answer,
             contexts,
             result,
+            item.expected_answer_points,
         )
         retrieval_metrics = self._compute_retrieval_metrics(item, result)
 
@@ -100,9 +109,11 @@ class MedicalRAGEvaluationService:
         return await asyncio.to_thread(retriever.retrieve, question)
 
     def _assert_naive_vector_contract(self, requested_method: str, result: RetrievalResult) -> None:
-        if requested_method in {"vector", "vector_naive"}:
-            collection = result.debug.get("collection")
-            mode = result.debug.get("vector_text_mode")
+        if requested_method in {"vector", "vector_naive", "vector_ce"}:
+            debug = result.debug.get("base_debug") if requested_method == "vector_ce" else result.debug
+            debug = debug or result.debug
+            collection = debug.get("collection")
+            mode = debug.get("vector_text_mode")
             if collection != NAIVE_CHUNK_COLLECTION or mode != "raw_chunk_text":
                 raise RuntimeError(
                     "Naive vector contract violated: "
@@ -110,15 +121,16 @@ class MedicalRAGEvaluationService:
                     f"Expected collection={NAIVE_CHUNK_COLLECTION}, mode=raw_chunk_text."
                 )
 
-        if requested_method == "mixed":
-            branch_debug = result.debug.get("branch_debug") or {}
+        if requested_method in {"mixed", "mixed_ce"}:
+            base_debug = result.debug.get("base_debug") if requested_method == "mixed_ce" else result.debug
+            branch_debug = (base_debug or result.debug).get("branch_debug") or {}
             vector_debug = branch_debug.get("vector") or {}
             collection = vector_debug.get("collection")
             mode = vector_debug.get("vector_text_mode")
             if collection != NAIVE_CHUNK_COLLECTION or mode != "raw_chunk_text":
                 raise RuntimeError(
                     "Mixed retriever is not using naive vector branch: "
-                    f"collection={collection}, mode={mode}. "
+                    f"method={requested_method}, collection={collection}, mode={mode}. "
                     f"Expected collection={NAIVE_CHUNK_COLLECTION}, mode=raw_chunk_text."
                 )
 
@@ -146,13 +158,22 @@ class MedicalRAGEvaluationService:
                     "ragas_style_overall",
                     "medical_safety",
                     "answer_correctness",
-                    "retrieval_hit_at_1",
-                    "retrieval_hit_at_3",
-                    "retrieval_hit_at_5",
-                    "retrieval_mrr",
-                    "retrieval_first_hit_rank",
-                    "retrieval_matched_terms",
-                    "verdict",
+                    "answer_point_coverage",
+                    "covered_answer_points",
+                    "missing_answer_points",
+                    "answer_correctness_rationale",
+                    "term_hit_at_1",
+                    "term_hit_at_3",
+                    "term_hit_at_5",
+                    "term_mrr",
+                    "term_first_hit_rank",
+                    "matched_terms",
+                    "source_hit_at_1",
+                    "source_hit_at_3",
+                    "source_hit_at_5",
+                    "source_mrr",
+                    "source_first_hit_rank",
+                    "matched_source_links",
                     "rationale",
                 ],
             )
@@ -171,13 +192,22 @@ class MedicalRAGEvaluationService:
                     "ragas_style_overall": eval_result.ragas_style_overall if eval_result else "",
                     "medical_safety": eval_result.medical_safety if eval_result else "",
                     "answer_correctness": eval_result.answer_correctness if eval_result else "",
-                    "retrieval_hit_at_1": retrieval_metrics.hit_at_1 if retrieval_metrics else "",
-                    "retrieval_hit_at_3": retrieval_metrics.hit_at_3 if retrieval_metrics else "",
-                    "retrieval_hit_at_5": retrieval_metrics.hit_at_5 if retrieval_metrics else "",
-                    "retrieval_mrr": retrieval_metrics.mrr if retrieval_metrics else "",
-                    "retrieval_first_hit_rank": retrieval_metrics.first_hit_rank if retrieval_metrics else "",
-                    "retrieval_matched_terms": "; ".join(retrieval_metrics.matched_terms) if retrieval_metrics else "",
-                    "verdict": eval_result.verdict if eval_result else "",
+                    "answer_point_coverage": eval_result.answer_point_coverage if eval_result else "",
+                    "covered_answer_points": "; ".join(eval_result.covered_answer_points) if eval_result else "",
+                    "missing_answer_points": "; ".join(eval_result.missing_answer_points) if eval_result else "",
+                    "answer_correctness_rationale": eval_result.answer_correctness_rationale if eval_result else "",
+                    "term_hit_at_1": retrieval_metrics.term_hit_at_1 if retrieval_metrics else "",
+                    "term_hit_at_3": retrieval_metrics.term_hit_at_3 if retrieval_metrics else "",
+                    "term_hit_at_5": retrieval_metrics.term_hit_at_5 if retrieval_metrics else "",
+                    "term_mrr": retrieval_metrics.term_mrr if retrieval_metrics else "",
+                    "term_first_hit_rank": retrieval_metrics.term_first_hit_rank if retrieval_metrics else "",
+                    "matched_terms": "; ".join(retrieval_metrics.matched_terms) if retrieval_metrics else "",
+                    "source_hit_at_1": retrieval_metrics.source_hit_at_1 if retrieval_metrics else "",
+                    "source_hit_at_3": retrieval_metrics.source_hit_at_3 if retrieval_metrics else "",
+                    "source_hit_at_5": retrieval_metrics.source_hit_at_5 if retrieval_metrics else "",
+                    "source_mrr": retrieval_metrics.source_mrr if retrieval_metrics else "",
+                    "source_first_hit_rank": retrieval_metrics.source_first_hit_rank if retrieval_metrics else "",
+                    "matched_source_links": "; ".join(retrieval_metrics.matched_source_links) if retrieval_metrics else "",
                     "rationale": eval_result.rationale if eval_result else "",
                 })
 
@@ -195,10 +225,15 @@ class MedicalRAGEvaluationService:
                     "ragas_style_overall",
                     "medical_safety",
                     "answer_correctness",
-                    "retrieval_hit_at_1",
-                    "retrieval_hit_at_3",
-                    "retrieval_hit_at_5",
-                    "retrieval_mrr",
+                    "answer_point_coverage",
+                    "term_hit_at_1",
+                    "term_hit_at_3",
+                    "term_hit_at_5",
+                    "term_mrr",
+                    "source_hit_at_1",
+                    "source_hit_at_3",
+                    "source_hit_at_5",
+                    "source_mrr",
                 ],
             )
             writer.writeheader()
@@ -217,12 +252,17 @@ class MedicalRAGEvaluationService:
             "ragas_style_overall",
             "medical_safety",
             "answer_correctness",
+            "answer_point_coverage",
         ]
         retrieval_metric_names = [
-            "hit_at_1",
-            "hit_at_3",
-            "hit_at_5",
-            "mrr",
+            "term_hit_at_1",
+            "term_hit_at_3",
+            "term_hit_at_5",
+            "term_mrr",
+            "source_hit_at_1",
+            "source_hit_at_3",
+            "source_hit_at_5",
+            "source_mrr",
         ]
         for method, values in grouped.items():
             item: dict[str, Any] = {"method": method, "count": len(values)}
@@ -235,7 +275,7 @@ class MedicalRAGEvaluationService:
                     for row in values
                     if row.retrieval_metrics is not None
                 ]
-                item[f"retrieval_{metric}"] = round(sum(scores) / len(scores), 4) if scores else ""
+                item[metric] = round(sum(scores) / len(scores), 4) if scores else ""
             result.append(item)
         return sorted(result, key=lambda x: str(x["method"]))
 
@@ -246,17 +286,44 @@ class MedicalRAGEvaluationService:
         result: RetrievalResult,
     ) -> RetrievalMetricResult:
         expected_terms = [term for term in item.expected_terms if term and term.strip()]
-        if not expected_terms:
-            return RetrievalMetricResult()
+        expected_source_links = [link for link in item.source_links if link and link.strip()]
 
+        ranked_texts: list[str] = []
+        ranked_sources: list[list[str]] = []
+        for chunk in result.chunks[:10]:
+            ranked_texts.append("\n".join([chunk.title, chunk.section, chunk.text, chunk.contextualized_text]))
+            ranked_sources.append(self._chunk_source_candidates(chunk))
+
+        term_rank, matched_terms = self._first_term_hit(expected_terms, ranked_texts)
+        source_rank, matched_sources = self._first_source_hit(expected_source_links, ranked_sources)
+
+        return RetrievalMetricResult(
+            expected_terms=expected_terms,
+            expected_source_links=expected_source_links,
+            term_hit_at_1=1.0 if term_rank is not None and term_rank <= 1 else 0.0,
+            term_hit_at_3=1.0 if term_rank is not None and term_rank <= 3 else 0.0,
+            term_hit_at_5=1.0 if term_rank is not None and term_rank <= 5 else 0.0,
+            term_mrr=round(1.0 / term_rank, 4) if term_rank else 0.0,
+            term_first_hit_rank=term_rank,
+            matched_terms=matched_terms,
+            source_hit_at_1=1.0 if source_rank is not None and source_rank <= 1 else 0.0,
+            source_hit_at_3=1.0 if source_rank is not None and source_rank <= 3 else 0.0,
+            source_hit_at_5=1.0 if source_rank is not None and source_rank <= 5 else 0.0,
+            source_mrr=round(1.0 / source_rank, 4) if source_rank else 0.0,
+            source_first_hit_rank=source_rank,
+            matched_source_links=matched_sources,
+        )
+
+    def _first_term_hit(
+        self,
+        expected_terms: list[str],
+        ranked_texts: list[str],
+    ) -> tuple[int | None, list[str]]:
+        if not expected_terms:
+            return None, []
         normalized_terms = [normalize_text(term) for term in expected_terms]
         first_hit_rank: int | None = None
         matched_terms: list[str] = []
-
-        ranked_texts: list[str] = []
-        for chunk in result.chunks[:10]:
-            ranked_texts.append("\n".join([chunk.title, chunk.section, chunk.text, chunk.contextualized_text]))
-
         for rank, text in enumerate(ranked_texts, start=1):
             normalized = normalize_text(text)
             terms_in_rank = [
@@ -270,27 +337,129 @@ class MedicalRAGEvaluationService:
                 for term in terms_in_rank:
                     if term not in matched_terms:
                         matched_terms.append(term)
+        return first_hit_rank, matched_terms
 
-        if first_hit_rank is None:
-            return RetrievalMetricResult(
-                expected_terms=expected_terms,
-                hit_at_1=0.0,
-                hit_at_3=0.0,
-                hit_at_5=0.0,
-                mrr=0.0,
-                first_hit_rank=None,
-                matched_terms=matched_terms,
-            )
+    def _first_source_hit(
+        self,
+        expected_source_links: list[str],
+        ranked_sources: list[list[str]] | list[str],
+    ) -> tuple[int | None, list[str]]:
+        if not expected_source_links:
+            return None, []
 
-        return RetrievalMetricResult(
-            expected_terms=expected_terms,
-            hit_at_1=1.0 if first_hit_rank <= 1 else 0.0,
-            hit_at_3=1.0 if first_hit_rank <= 3 else 0.0,
-            hit_at_5=1.0 if first_hit_rank <= 5 else 0.0,
-            mrr=round(1.0 / first_hit_rank, 4),
-            first_hit_rank=first_hit_rank,
-            matched_terms=matched_terms,
-        )
+        expected_pairs = [
+            (original, self._normalize_url(original))
+            for original in expected_source_links
+        ]
+        first_hit_rank: int | None = None
+        matched_links: list[str] = []
+
+        for rank, raw_sources in enumerate(ranked_sources, start=1):
+            if isinstance(raw_sources, str):
+                candidate_sources = [raw_sources]
+            else:
+                candidate_sources = list(raw_sources or [])
+
+            normalized_sources = [
+                self._normalize_url(source)
+                for source in candidate_sources
+                if source
+            ]
+            normalized_sources = [source for source in normalized_sources if source]
+            if not normalized_sources:
+                continue
+
+            for original, expected in expected_pairs:
+                if not expected:
+                    continue
+                if any(self._urls_match(source, expected) for source in normalized_sources):
+                    if first_hit_rank is None:
+                        first_hit_rank = rank
+                    if original not in matched_links:
+                        matched_links.append(original)
+
+        return first_hit_rank, matched_links
+
+    def _chunk_source_candidates(self, chunk) -> list[str]:
+        metadata = dict(getattr(chunk, "metadata", None) or {})
+        values: list[str] = []
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add(item)
+                return
+            text = str(value).strip()
+            if text and text not in values:
+                values.append(text)
+
+        add(getattr(chunk, "source_url", ""))
+        for key in (
+            "source_url",
+            "url",
+            "article_url",
+            "canonical_url",
+            "source_link",
+            "source_links",
+            "source",
+        ):
+            add(metadata.get(key))
+
+        return values
+
+    def _urls_match(self, source: str, expected: str) -> bool:
+        if not source or not expected:
+            return False
+        if source == expected:
+            return True
+        if source.endswith(expected) or expected.endswith(source):
+            return True
+
+        source_slug = self._url_slug(source)
+        expected_slug = self._url_slug(expected)
+        if source_slug and expected_slug and source_slug == expected_slug:
+            return True
+
+        return False
+
+    def _url_slug(self, normalized_url: str) -> str:
+        text = (normalized_url or "").rstrip("/")
+        if not text:
+            return ""
+        return text.rsplit("/", 1)[-1]
+
+    def _normalize_url(self, value: str) -> str:
+        text = str(value or "").strip().strip("<>\"'").lower()
+        if not text:
+            return ""
+
+        # Remove markdown-like wrappers and tracking fragments.
+        text = text.split("#", 1)[0].split("?", 1)[0].strip().rstrip("/")
+        text = re.sub(r"^\[(.*?)\]\((.*?)\)$", r"\2", text)
+
+        parse_input = text
+        if "://" not in parse_input and re.match(r"^[a-z0-9.-]+\.", parse_input):
+            parse_input = "https://" + parse_input
+
+        parsed = urlparse(parse_input)
+        if parsed.netloc:
+            host = parsed.netloc
+            if host.startswith("www."):
+                host = host[4:]
+            path = unquote(parsed.path or "").rstrip("/")
+            path = re.sub(r"/amp$", "", path)
+            path = re.sub(r"/+", "/", path)
+            return f"{host}{path}".rstrip("/")
+
+        text = re.sub(r"^https?://", "", text)
+        if text.startswith("www."):
+            text = text[4:]
+        text = unquote(text).rstrip("/")
+        text = re.sub(r"/amp$", "", text)
+        text = re.sub(r"/+", "/", text)
+        return text
 
     def _result_to_compact_dict(self, result: RetrievalResult) -> dict[str, Any]:
         return {
@@ -299,6 +468,7 @@ class MedicalRAGEvaluationService:
             "keywords": dataclasses.asdict(result.keywords) if result.keywords else None,
             "top_chunk_ids": [chunk.chunk_id for chunk in result.chunks[:10]],
             "top_chunk_titles": [chunk.title for chunk in result.chunks[:10]],
+            "top_chunk_source_urls": [chunk.source_url for chunk in result.chunks[:10]],
             "top_entities": [e.name for e in result.entities[:10]],
             "top_relations": [
                 f"{r.subject_name} -[{r.relation_type}]-> {r.object_name}"

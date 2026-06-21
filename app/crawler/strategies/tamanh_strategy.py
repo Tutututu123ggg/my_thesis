@@ -5,11 +5,15 @@ import scrapy
 from bs4 import BeautifulSoup, Tag
 
 from app.crawler.markdown_converter import html_to_markdown, normalize_space
+from app.crawler.strategies.base_strategy import BaseMedicalStrategy
 
 
-class TamAnhStrategy:
+class TamAnhStrategy(BaseMedicalStrategy):
     source = "tamanh"
+    source_name = "Tâm Anh"
+    source_domain = "tamanhhospital.vn"
     allowed_domain = "tamanhhospital.vn"
+    allowed_domains = ["tamanhhospital.vn"]
 
     seed_urls = [
         "https://tamanhhospital.vn/benh-hoc-a-z/",
@@ -106,6 +110,8 @@ class TamAnhStrategy:
 
     line_noise_prefixes = (
         "Xem thêm:",
+        ">>> Xem thêm:",
+        "**>>> Xem thêm:**",
         "Tìm hiểu thêm:",
         "Tham khảo thêm:",
         "Xem chi tiết:",
@@ -405,12 +411,13 @@ class TamAnhStrategy:
 
         clean_html = self.clean_article_html(raw_html)
         markdown = html_to_markdown(clean_html)
+        return self.clean_markdown(markdown, title=title)
 
+    def clean_markdown(self, markdown: str, title: str | None = None) -> str:
         markdown = self.remove_duplicate_intro_lines(markdown, title=title)
         markdown = self.promote_plain_heading_lines(markdown)
         markdown = self.cut_after_medical_content(markdown)
         markdown = self.final_markdown_cleanup(markdown, title=title)
-
         return markdown.strip()
 
     def remove_duplicate_intro_lines(
@@ -528,6 +535,11 @@ class TamAnhStrategy:
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
+    def extract_medical_reviewed_by(self, response: scrapy.http.Response) -> str | None:
+        # Tâm Anh pages may have a medical reviewer block, but it is optional.
+        # Returning None keeps the crawler compatible with older strategy versions.
+        return None
+
     def extract_related_links(
         self,
         response: scrapy.http.Response,
@@ -628,6 +640,7 @@ class TamAnhStrategy:
             result.append(line)
 
         text = "\n".join(result)
+        text = self.strip_markdown_links(text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 

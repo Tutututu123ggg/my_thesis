@@ -47,6 +47,9 @@ class ExtractionService:
                 "section": chunk.section,
                 "subsection": chunk.subsection,
                 "source_url": chunk.source_url,
+                "is_medical_knowledge_chunk": graph.is_medical_knowledge_chunk,
+                "should_ingest_graph": graph.should_ingest_graph,
+                "skip_reason": graph.skip_reason,
                 "entities": [e.model_dump() for e in graph.entities],
                 "relations": [r.model_dump() for r in graph.relations],
             }

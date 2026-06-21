@@ -21,29 +21,31 @@ def make_section_id(article_id: str, order: int, title: str) -> str:
 
 
 def parse_sections(article: ArticleDocument) -> list[SectionDocument]:
-    """
-    Split Markdown theo heading.
+    """Split Markdown into section documents while preserving heading ancestry.
 
-    Quy tắc:
-    - Bỏ H1 title vì Article đã có title.
-    - H2 là section.
-    - H3+ là subsection.
-    - Nếu đoạn mở đầu trước H2 có nội dung, tạo section "Tóm tắt".
+    Design:
+    - H1 title is skipped because ``ArticleDocument.title`` already stores it.
+    - Every non-empty text block under a heading becomes one ``SectionDocument``.
+    - ``heading_path`` stores the active heading chain at the start of that
+      section, e.g. ["2. Điều trị", "2.1. Thuốc bôi"].
+
+    The heading path is not meant to replace raw text. It is extraction context
+    so bullet/list chunks do not lose their parent subject.
     """
     lines = article.body.splitlines()
 
     sections: list[SectionDocument] = []
+    heading_stack: list[tuple[int, str]] = []
 
     current_title = "Tóm tắt"
     current_level = 2
     current_parent: str | None = None
+    current_heading_path: list[str] = []
     current_lines: list[str] = []
     order = 0
 
-    last_h2: str | None = None
-
     def flush() -> None:
-        nonlocal order, current_lines, current_title, current_level, current_parent
+        nonlocal order, current_lines, current_title, current_level, current_parent, current_heading_path
 
         text = "\n".join(current_lines).strip()
         if not text:
@@ -58,6 +60,7 @@ def parse_sections(article: ArticleDocument) -> list[SectionDocument]:
             section_title=current_title,
             section_level=current_level,
             parent_section_title=current_parent,
+            heading_path=list(current_heading_path),
             text=text,
             order=order,
         )
@@ -74,21 +77,22 @@ def parse_sections(article: ArticleDocument) -> list[SectionDocument]:
             level = len(hashes)
             heading_text = strip_heading_format(heading_text)
 
-            # Bỏ H1 trùng title
+            # Skip article H1. The article title is already passed separately.
             if level == 1 and heading_text == article.title:
                 continue
 
             flush()
 
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+
+            parent = heading_stack[-1][1] if heading_stack else None
+            heading_stack.append((level, heading_text))
+
             current_title = heading_text
             current_level = level
-
-            if level == 2:
-                last_h2 = heading_text
-                current_parent = None
-            elif level >= 3:
-                current_parent = last_h2
-
+            current_parent = parent
+            current_heading_path = [title for _, title in heading_stack]
             continue
 
         current_lines.append(line)

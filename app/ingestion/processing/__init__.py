@@ -9,6 +9,7 @@ from app.ingestion.processing.markdown_loader import (
 )
 from app.ingestion.processing.section_parser import parse_sections
 from app.ingestion.processing.chunker import chunk_article, chunk_sections
+from app.ingestion.processing.fact_window import build_fact_windows_for_chunks, split_chunk_into_fact_windows
 
 __all__ = [
     "ArticleDocument",
@@ -19,4 +20,6 @@ __all__ = [
     "parse_sections",
     "chunk_article",
     "chunk_sections",
+    "build_fact_windows_for_chunks",
+    "split_chunk_into_fact_windows",
 ]

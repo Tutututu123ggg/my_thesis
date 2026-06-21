@@ -8,6 +8,10 @@ from app.ingestion.extraction import (
     ExtractedRelation,
 )
 from app.ingestion.processing import ChunkDocument
+from app.ingestion.extraction.keyword_profiler import (
+    clean_retrieval_keywords,
+    deterministic_relation_keywords,
+)
 from app.ingestion.resolution import (
     EntityResolver,
     ResolvedEntity,
@@ -45,6 +49,16 @@ class MedicalGraphBuilder:
 
         Return thống kê để print/debug.
         """
+        if not extracted_graph.should_ingest_graph:
+            return {
+                "chunk_id": chunk.chunk_id,
+                "entity_write_count": 0,
+                "mention_write_count": 0,
+                "relation_write_count": 0,
+                "skipped_graph_ingest": True,
+                "skip_reason": extracted_graph.skip_reason,
+            }
+
         resolved_by_key: dict[tuple[str, str], ResolvedEntity] = {}
 
         entity_write_count = 0
@@ -103,15 +117,9 @@ class MedicalGraphBuilder:
                 object_entity_id=object_.entity_id,
             )
 
-            keyword_profile = self.keyword_profiles.generate_relation_profile(
-                relation_type=relation.relation_type,
-                subject_name=subject.name,
-                subject_type=subject.entity_type,
-                object_name=object_.name,
-                object_type=object_.entity_type,
-                description=relation.description,
-                evidence_text=relation.evidence_text,
-            )
+            relation_keywords = clean_retrieval_keywords(relation.keywords, limit=8)
+            if not relation_keywords:
+                relation_keywords = deterministic_relation_keywords(relation)
 
             medical_relation = MedicalRelation(
                 relation_id=relation_id,
@@ -119,7 +127,7 @@ class MedicalGraphBuilder:
                 object_entity_id=object_.entity_id,
                 relation_type=relation.relation_type,
                 description=relation.description,
-                keywords=keyword_profile.keywords,
+                keywords=relation_keywords,
                 evidence_text=relation.evidence_text,
                 evidence_chunk_ids=[chunk.chunk_id],
                 confidence=relation.confidence,
@@ -129,7 +137,7 @@ class MedicalGraphBuilder:
                     "subsection": chunk.subsection,
                     "title": chunk.title,
                     "original_llm_keywords": relation.keywords,
-                    "keyword_policy": "lightrag_global_relation_keywords",
+                    "keyword_policy": "article_keyword_profiler_or_deterministic_fallback",
                 },
             )
 
@@ -147,6 +155,8 @@ class MedicalGraphBuilder:
             "entity_write_count": entity_write_count,
             "mention_write_count": mention_write_count,
             "relation_write_count": relation_write_count,
+            "skipped_graph_ingest": False,
+            "skip_reason": None,
         }
 
     def _resolve_relation_endpoint(

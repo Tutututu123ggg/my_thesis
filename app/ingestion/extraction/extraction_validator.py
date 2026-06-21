@@ -2,8 +2,12 @@ import re
 import unicodedata
 
 from app.domain.medical_schema import (
+    ENTITY_TYPES,
+    RELATION_TYPES,
+    get_all_relation_keyword_intents,
+    get_relation_keyword_intent,
     is_valid_entity_type,
-    is_valid_relation_schema,
+    is_valid_relation_by_schema_policy,
     looks_like_blocked_entity,
 )
 from app.ingestion.extraction.extraction_models import (
@@ -11,53 +15,39 @@ from app.ingestion.extraction.extraction_models import (
     ExtractedGraph,
     ExtractedRelation,
 )
+from app.ingestion.extraction.keyword_profiler import (
+    clean_retrieval_keywords,
+    deterministic_relation_keywords,
+)
 
 
-SYNONYM_POSITIVE_CUES = [
-    "còn gọi là",
-    "còn được gọi là",
-    "hay gọi là",
-    "còn có tên là",
-    "tên khác là",
-    "tên gọi khác",
-    "tiếng anh là",
-    "tên tiếng anh",
-    "viết tắt là",
-    "aka",
-    "also known as",
-]
+# Validator philosophy:
+# - LLM decides medical semantics.
+# - Validator only normalizes output and removes format/invariant errors.
+# - Do not drop/remap relations because their relation_type seems semantically imperfect.
+# - Keep recall high for GraphRAG; final grounding still comes from evidence passages.
 
-SYNONYM_NEGATIVE_CUES = [
-    "là dạng của",
-    "là một dạng",
-    "là thể của",
-    "là một thể",
-    "là loại",
-    "là một loại",
-    "phân loại",
-    "bao gồm các thể",
-    "các dạng",
-]
+# If True, only entities that appear as endpoints of validated relations are kept.
+# False is safer for recall/debug because medical chunks with entities but no relations
+# will not become empty. Set True only when you intentionally want a strict triple-first KG.
+KEEP_ONLY_RELATION_ENDPOINT_ENTITIES = False
 
-RELATION_INTENT_KEYWORDS = {
-    "LA_DANG_CUA": "phân loại",
-    "DONG_NGHIA_VOI": "tên gọi khác",
-    "CHAN_DOAN_PHAN_BIET_VOI": "chẩn đoán phân biệt",
-    "CO_BIEU_HIEN": "triệu chứng",
-    "LIEN_QUAN_YEU_TO": "yếu tố liên quan",
-    "GAY_BIEN_CHUNG": "biến chứng",
-    "ANH_HUONG_DEN": "ảnh hưởng",
-    "CHAN_DOAN_BANG": "chẩn đoán",
-    "DIEU_TRI_BANG": "điều trị",
-    "PHONG_NGUA_BANG": "phòng ngừa",
-    "CAN_TRANH": "cần tránh",
-    "CHONG_CHI_DINH": "chống chỉ định",
-    "TUONG_TAC_VOI": "tương tác",
+
+GENERIC_KEYWORDS = {
+    "triệu chứng",
+    "biểu hiện",
+    "điều trị",
+    "biến chứng",
+    "chẩn đoán",
+    "nguyên nhân",
+    "phòng ngừa",
+    "yếu tố",
+    "bệnh lý",
 }
 
 
 def normalize_name(name: str) -> str:
-    name = name.strip().lower()
+    name = str(name or "").strip().lower()
     name = name.replace("đ", "d").replace("Đ", "D")
     name = unicodedata.normalize("NFD", name)
     name = name.encode("ascii", "ignore").decode("utf-8")
@@ -65,8 +55,32 @@ def normalize_name(name: str) -> str:
     return name.strip()
 
 
+def humanize_schema_token(value: str) -> str:
+    return str(value or "").lower().replace("_", " ").strip()
+
+
+def schema_keyword_keys() -> set[str]:
+    values: set[str] = set()
+
+    for item in ENTITY_TYPES:
+        values.add(normalize_name(item))
+        values.add(normalize_name(humanize_schema_token(item)))
+
+    for item in RELATION_TYPES:
+        values.add(normalize_name(item))
+        values.add(normalize_name(humanize_schema_token(item)))
+
+    for item in get_all_relation_keyword_intents():
+        values.add(normalize_name(item))
+
+    return {value for value in values if value}
+
+
+SCHEMA_KEYWORD_KEYS = schema_keyword_keys()
+
+
 def clean_entity_name(name: str) -> str:
-    name = name.strip()
+    name = str(name or "").strip()
     name = re.sub(r"\s+", " ", name)
 
     # Bỏ markdown emphasis ở tên entity, nhưng không động vào evidence_text.
@@ -78,7 +92,7 @@ def clean_entity_name(name: str) -> str:
 
 
 def clean_short_text(text: str, max_chars: int = 500) -> str:
-    text = text.strip()
+    text = str(text or "").strip()
     text = re.sub(r"\s+", " ", text)
     text = text.replace("**", "")
     text = text.replace("__", "")
@@ -101,38 +115,40 @@ def is_bad_entity_name(name: str) -> bool:
     return False
 
 
-def unique_keep_order(items: list[str]) -> list[str]:
-    seen = set()
-    result = []
+def is_schema_like_keyword(keyword: str) -> bool:
+    key = normalize_name(keyword)
+    if not key:
+        return True
 
-    for item in items:
-        cleaned = clean_entity_name(item)
-        key = normalize_name(cleaned)
+    if key in SCHEMA_KEYWORD_KEYS:
+        return True
 
-        if not key or key in seen:
-            continue
+    # Drop generic facet if it stands alone. Anchored phrases such as
+    # "triệu chứng của hen phế quản" are kept by clean_relation_keywords.
+    if key in {normalize_name(item) for item in GENERIC_KEYWORDS}:
+        return True
 
-        seen.add(key)
-        result.append(cleaned)
-
-    return result
+    return False
 
 
-def clean_keywords(items: list[str], limit: int = 5) -> list[str]:
+def clean_keywords(items: list[str], limit: int = 8) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
 
-    for item in items:
-        cleaned = clean_short_text(item, max_chars=80)
+    for item in items or []:
+        cleaned = clean_short_text(str(item), max_chars=80)
         key = normalize_name(cleaned)
 
         if not key or key in seen:
             continue
 
-        if len(cleaned.split()) > 8:
+        if len(cleaned.split()) > 10:
             continue
 
         if looks_like_blocked_entity(cleaned):
+            continue
+
+        if is_schema_like_keyword(cleaned):
             continue
 
         seen.add(key)
@@ -144,83 +160,48 @@ def clean_keywords(items: list[str], limit: int = 5) -> list[str]:
     return result
 
 
-def contains_any_normalized(text: str, cues: list[str]) -> bool:
-    normalized_text = normalize_name(text)
-    return any(normalize_name(cue) in normalized_text for cue in cues)
-
-
-def has_parenthetical_synonym_evidence(
-    evidence_text: str,
+def clean_relation_keywords(
+    items: list[str],
     subject: str,
     object_: str,
-) -> bool:
+    limit: int = 8,
+) -> list[str]:
+    """Clean LLM-proposed relation keywords conservatively.
+
+    Agent 1 is no longer trusted to create final LightRAG keywords. We keep
+    only short atomic retrieval terms and drop sentence/clause fragments. Final
+    deterministic fallback and optional article-level Agent 2 run later.
     """
-    Accept simple patterns such as:
-    - Bệnh chàm (Eczema)
-    - Eczema (bệnh chàm)
+    return clean_retrieval_keywords(items or [], limit=limit)
 
-    This is not a generic synonym detector. It only validates that both endpoint
-    strings appear close together in a parenthetical naming pattern.
-    """
-    evidence = normalize_name(evidence_text)
-    s = re.escape(normalize_name(subject))
-    o = re.escape(normalize_name(object_))
+def clamp_confidence(value: float | int | str | None) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return 0.5
 
-    if not s or not o:
-        return False
+    if confidence < 0.0:
+        return 0.0
 
-    patterns = [
-        rf"{s}\s*\(\s*{o}\s*\)",
-        rf"{o}\s*\(\s*{s}\s*\)",
-    ]
+    if confidence > 1.0:
+        return 1.0
 
-    return any(re.search(pattern, evidence) for pattern in patterns)
-
-
-def looks_like_question_only(evidence_text: str) -> bool:
-    text = evidence_text.strip()
-    if not text:
-        return True
-
-    lowered = text.lower()
-
-    if "?" in text:
-        return True
-
-    question_starters = [
-        "khi nào",
-        "vì sao",
-        "tại sao",
-        "làm gì",
-        "làm thế nào",
-        "có nên",
-        "có cần",
-        "bao lâu",
-        "bao nhiêu",
-        "ai",
-        "ở đâu",
-    ]
-
-    return any(lowered.startswith(starter) for starter in question_starters)
+    return confidence
 
 
 def make_fallback_keywords(relation: ExtractedRelation) -> list[str]:
-    """Fallback LightRAG-style mixed-level relation keywords.
-
-    LightRAG uses low-level/local keywords for concrete details and high-level/global
-    keywords for broader themes. When the LLM omits keywords, keep a small safe mix:
-    subject/object as concrete retrieval signals plus the relation intent as a broad signal.
-    """
-    intent = RELATION_INTENT_KEYWORDS.get(
-        relation.relation_type,
-        relation.relation_type.lower(),
-    )
-    return clean_keywords([relation.subject, relation.object, intent], limit=10)
+    """Safe deterministic keywords used when Agent 1 returns nothing usable."""
+    return deterministic_relation_keywords(relation)
 
 
 class ExtractionValidator:
     """
-    Validate schema + lọc nhiễu cho LLM output.
+    Normalize and format-check LLM extraction output.
+
+    This validator intentionally avoids semantic judging. In particular, it does
+    NOT drop/remap a relation just because the chosen relation_type may be less
+    ideal. For GraphRAG, keeping a useful edge with faithful evidence is usually
+    better than dropping it and losing the passage bridge.
 
     Lưu ý:
     - aliases = deprecated/unused for new extraction; validator always sets [].
@@ -232,6 +213,15 @@ class ExtractionValidator:
     """
 
     def validate(self, graph: ExtractedGraph) -> ExtractedGraph:
+        if not graph.is_medical_knowledge_chunk:
+            return ExtractedGraph(
+                is_medical_knowledge_chunk=False,
+                should_ingest_graph=False,
+                skip_reason=graph.skip_reason or "non_medical_knowledge_chunk",
+                entities=[],
+                relations=[],
+            )
+
         entities = self._validate_entities(graph.entities)
         entity_map = {
             (normalize_name(e.name), e.entity_type): e
@@ -240,10 +230,21 @@ class ExtractionValidator:
 
         relations = self._validate_relations(graph.relations)
 
-        # Thêm entity bị relation nhắc đến nhưng LLM quên đưa vào entities.
+        # Add endpoint entities if the LLM forgot to include them in entities[].
+        endpoint_keys: list[tuple[str, str]] = []
+        seen_endpoint_keys: set[tuple[str, str]] = set()
+
+        def remember_endpoint(key: tuple[str, str]) -> None:
+            if key in seen_endpoint_keys:
+                return
+            seen_endpoint_keys.add(key)
+            endpoint_keys.append(key)
+
         for relation in relations:
             s_key = (normalize_name(relation.subject), relation.subject_type)
             o_key = (normalize_name(relation.object), relation.object_type)
+            remember_endpoint(s_key)
+            remember_endpoint(o_key)
 
             if s_key not in entity_map:
                 entity = ExtractedEntity(
@@ -269,7 +270,14 @@ class ExtractionValidator:
                 entities.append(entity)
                 entity_map[o_key] = entity
 
+        if KEEP_ONLY_RELATION_ENDPOINT_ENTITIES:
+            entities = [entity_map[key] for key in endpoint_keys if key in entity_map]
+
+        should_ingest_graph = bool(entities or relations)
         return ExtractedGraph(
+            is_medical_knowledge_chunk=True,
+            should_ingest_graph=should_ingest_graph,
+            skip_reason=None if should_ingest_graph else "no_valid_medical_entities_or_relations",
             entities=entities,
             relations=relations,
         )
@@ -280,9 +288,9 @@ class ExtractionValidator:
     ) -> list[ExtractedEntity]:
         by_key: dict[tuple[str, str], ExtractedEntity] = {}
 
-        for entity in entities:
+        for entity in entities or []:
             name = clean_entity_name(entity.name)
-            entity_type = entity.entity_type.strip()
+            entity_type = str(entity.entity_type or "").strip()
 
             if not is_valid_entity_type(entity_type):
                 continue
@@ -291,7 +299,7 @@ class ExtractionValidator:
                 continue
 
             description = clean_short_text(entity.description, max_chars=500)
-            evidence_text = entity.evidence_text.strip()
+            evidence_text = clean_short_text(entity.evidence_text, max_chars=800)
 
             key = (normalize_name(name), entity_type)
 
@@ -325,41 +333,35 @@ class ExtractionValidator:
         result: list[ExtractedRelation] = []
         seen: set[tuple[str, str, str, str, str]] = set()
 
-        for relation in relations:
+        for relation in relations or []:
             subject = clean_entity_name(relation.subject)
             object_ = clean_entity_name(relation.object)
-            subject_type = relation.subject_type.strip()
-            object_type = relation.object_type.strip()
-            relation_type = relation.relation_type.strip()
-            evidence_text = relation.evidence_text.strip()
+            subject_type = str(relation.subject_type or "").strip()
+            object_type = str(relation.object_type or "").strip()
+            relation_type = str(relation.relation_type or "").strip()
+            evidence_text = clean_short_text(relation.evidence_text, max_chars=1000)
 
+            # Format/invariant checks only.
             if is_bad_entity_name(subject) or is_bad_entity_name(object_):
                 continue
 
-            if not is_valid_relation_schema(
-                relation_type=relation_type,
-                subject_type=subject_type,
-                object_type=object_type,
-            ):
+            if normalize_name(subject) == normalize_name(object_):
+                continue
+
+            if subject_type not in ENTITY_TYPES or object_type not in ENTITY_TYPES:
+                continue
+
+            if relation_type not in RELATION_TYPES:
                 continue
 
             if not evidence_text:
                 continue
 
-            if looks_like_question_only(evidence_text):
-                continue
-
-            if relation_type == "DONG_NGHIA_VOI" and not self._is_valid_synonym_relation(
-                subject=subject,
-                subject_type=subject_type,
-                object_=object_,
-                object_type=object_type,
-                evidence_text=evidence_text,
+            if not is_valid_relation_by_schema_policy(
+                relation_type,
+                subject_type,
+                object_type,
             ):
-                continue
-
-            # Defensive rule. Schema should already enforce this after patching medical_schema.py.
-            if relation_type == "CHAN_DOAN_BANG" and object_type != "PHUONG_PHAP_CHAN_DOAN":
                 continue
 
             key = (
@@ -373,6 +375,13 @@ class ExtractionValidator:
             if key in seen:
                 continue
 
+            cleaned_keywords = clean_relation_keywords(
+                relation.keywords,
+                subject=subject,
+                object_=object_,
+                limit=8,
+            )
+
             cleaned_relation = ExtractedRelation(
                 subject=subject,
                 subject_type=subject_type,
@@ -380,9 +389,9 @@ class ExtractionValidator:
                 object=object_,
                 object_type=object_type,
                 description=clean_short_text(relation.description, max_chars=500),
-                keywords=clean_keywords(relation.keywords, limit=8),
+                keywords=cleaned_keywords,
                 evidence_text=evidence_text,
-                confidence=float(relation.confidence),
+                confidence=clamp_confidence(relation.confidence),
             )
 
             if not cleaned_relation.keywords:
@@ -392,28 +401,3 @@ class ExtractionValidator:
             seen.add(key)
 
         return result
-
-    def _is_valid_synonym_relation(
-        self,
-        subject: str,
-        subject_type: str,
-        object_: str,
-        object_type: str,
-        evidence_text: str,
-    ) -> bool:
-        if subject_type != object_type:
-            return False
-
-        if normalize_name(subject) == normalize_name(object_):
-            return False
-
-        if contains_any_normalized(evidence_text, SYNONYM_NEGATIVE_CUES):
-            return False
-
-        if contains_any_normalized(evidence_text, SYNONYM_POSITIVE_CUES):
-            return True
-
-        if has_parenthetical_synonym_evidence(evidence_text, subject, object_):
-            return True
-
-        return False

@@ -14,4 +14,10 @@ class ArticleItem:
     updated_at: str | None = None
     category: str | None = None
 
+    # Multi-source metadata. These fields are optional so old Tâm Anh code
+    # stays compatible, but new strategies can persist source/domain signals.
+    source_domain: str | None = None
+    source_name: str | None = None
+    medical_reviewed_by: str | None = None
+
     related_links: list[str] = field(default_factory=list)

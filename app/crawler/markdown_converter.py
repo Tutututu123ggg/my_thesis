@@ -67,11 +67,20 @@ def build_frontmatter(item: ArticleItem) -> str:
         f'title: "{escape_yaml(item.title)}"',
     ]
 
+    if item.source_domain:
+        lines.append(f'source_domain: "{escape_yaml(item.source_domain)}"')
+
+    if item.source_name:
+        lines.append(f'source_name: "{escape_yaml(item.source_name)}"')
+
     if item.description:
         lines.append(f'description: "{escape_yaml(item.description)}"')
 
     if item.author:
         lines.append(f'author: "{escape_yaml(item.author)}"')
+
+    if item.medical_reviewed_by:
+        lines.append(f'medical_reviewed_by: "{escape_yaml(item.medical_reviewed_by)}"')
 
     if item.published_at:
         lines.append(f'published_at: "{escape_yaml(item.published_at)}"')
@@ -100,10 +109,17 @@ def save_article_markdown(item: ArticleItem, output_dir: str | Path) -> Path:
     filename = f"{item.source}__{slugify(item.title)}__{url_hash}.md"
     path = output_dir / filename
 
+    body = item.markdown.strip()
+
+    # Strategies usually return body text without H1. If a strategy already
+    # emits H1, do not add another one. This prevents duplicate title blocks
+    # like: # Title / # Title / breadcrumb / # Title.
+    if not body.lstrip().startswith("# "):
+        body = f"# {item.title}\n\n{body}"
+
     content = build_frontmatter(item)
     content += "\n\n"
-    content += f"# {item.title}\n\n"
-    content += item.markdown.strip()
+    content += body
     content += "\n"
 
     path.write_text(content, encoding="utf-8")

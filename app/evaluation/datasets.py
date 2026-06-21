@@ -67,10 +67,39 @@ def load_evaluation_questions(path: str | Path) -> list[EvaluationQuestion]:
         if not expected_terms:
             expected_terms = _as_list(item.get("expected_entities"))
 
+        # These fields are used by answer-quality and source-hit metrics. Earlier
+        # versions kept them only inside metadata, which made source_hit@k always
+        # zero even when retrieved chunks had the correct source_url.
+        expected_answer_points = _as_list(
+            item.get("expected_answer_points")
+            or item.get("answer_points")
+            or item.get("checklist")
+        )
+        source_links = _as_list(
+            item.get("source_links")
+            or item.get("source_urls")
+            or item.get("sources")
+            or item.get("reference_sources")
+        )
+
         metadata = {
             k: v
             for k, v in item.items()
-            if k not in {"question", "reference", "reference_answer", "expected_answer", "expected_terms"}
+            if k not in {
+                "question",
+                "reference",
+                "reference_answer",
+                "expected_answer",
+                "expected_terms",
+                "expected_entities",
+                "expected_answer_points",
+                "answer_points",
+                "checklist",
+                "source_links",
+                "source_urls",
+                "sources",
+                "reference_sources",
+            }
         }
         metadata.setdefault("dataset_file", str(path))
         metadata.setdefault("row_index", idx)
@@ -81,6 +110,8 @@ def load_evaluation_questions(path: str | Path) -> list[EvaluationQuestion]:
                 reference=reference,
                 difficulty=str(item.get("difficulty", "unknown")),
                 expected_terms=expected_terms,
+                expected_answer_points=expected_answer_points,
+                source_links=source_links,
                 metadata=metadata,
             )
         )

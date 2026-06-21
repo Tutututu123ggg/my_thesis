@@ -307,6 +307,44 @@ class GraphRepository:
             result = session.run(q.GET_ALL_CHUNKS, {"limit": int(limit)})
             return [self._record_to_chunk(record) for record in result]
 
+    def get_chunks_by_article_ids(
+        self,
+        article_ids: list[str],
+        limit: int = 200,
+    ) -> list[ChunkNode]:
+        """Return chunks from the same articles for graph evidence expansion."""
+        article_ids = list(dict.fromkeys([item for item in article_ids if item]))
+        if not article_ids:
+            return []
+
+        with self.client.session() as session:
+            result = session.run(
+                q.GET_CHUNKS_BY_ARTICLE_IDS,
+                {"article_ids": article_ids, "limit": int(limit)},
+            )
+            return [self._record_to_chunk(record) for record in result]
+
+    def get_adjacent_chunks_by_chunk_ids(
+        self,
+        chunk_ids: list[str],
+        window: int = 1,
+        limit: int = 200,
+    ) -> list[ChunkNode]:
+        """Return previous/next chunks in the same article for evidence expansion."""
+        chunk_ids = list(dict.fromkeys([item for item in chunk_ids if item]))
+        if not chunk_ids:
+            return []
+
+        params = {
+            "chunk_ids": chunk_ids,
+            "window": max(int(window), 0),
+            "limit": int(limit),
+        }
+
+        with self.client.session() as session:
+            result = session.run(q.GET_ADJACENT_CHUNKS_BY_CHUNK_IDS, params)
+            return [self._record_to_chunk(record) for record in result]
+
     def get_entity_chunk_counts(self, entity_ids: list[str]) -> dict[str, int]:
         """Count distinct chunks mentioning each entity for HippoRAG node specificity."""
         if not entity_ids:

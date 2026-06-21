@@ -5,7 +5,10 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 
+from app.retrieval.evidence_expander import EvidenceExpansionConfig, GraphEvidenceExpander
 from app.retrieval.graph_retriever import GraphRetriever
+from app.retrieval.graph_scoring import GraphQueryScorer
+from app.retrieval.query_analyzer import QueryAnalyzer
 from app.retrieval.query_keywords import QueryKeywordExtractor
 from app.retrieval.retrieval_models import (
     QueryKeywords,
@@ -22,6 +25,7 @@ from app.retrieval.vector_retriever import VectorRetriever
 class LightRAGRetrievalConfig:
     entity_top_k: int = 20
     relation_top_k: int = 20
+    relation_candidate_multiplier: int = 3
     max_entities: int = 30
     max_relations: int = 40
     max_chunks: int = 12
@@ -37,14 +41,21 @@ class LightRAGRetrievalConfig:
     generic_chunk_ratio_threshold: float = 0.12
     constrain_relation_types_by_intent: bool = True
     constrain_relation_endpoints_to_entity_seeds: bool = True
+    enable_query_anchor_chunk_rerank: bool = True
+    query_phrase_query_top_k: int = 6
 
-    # Medical diagnosis queries should rank BENH_LY candidates first, then
-    # map the best disease candidates to evidence chunks. This prevents
-    # generic trigger nodes such as "dị ứng/phấn hoa/bụi" from dominating
-    # the final context before a disease candidate is established.
-    disease_candidate_first_for_symptom_queries: bool = True
+    # Optional disease-first pass. It is disabled by default because intent
+    # detection is no longer driven by hand-written cue arrays. If enabled by an
+    # experiment, candidate scoring is derived from observed graph relation
+    # scores instead of relation-type keyword maps.
+    enable_data_driven_disease_candidates: bool = False
     disease_candidate_top_k: int = 8
-    disease_relation_weights: dict[str, float] | None = None
+
+    # Graph branches may need complementary sections from the same article for
+    # differential/bridge questions. This is disabled for vector_naive and only
+    # applied after LightRAG has activated graph evidence.
+    enable_evidence_expansion: bool = True
+    evidence_expansion: EvidenceExpansionConfig | None = None
 
 
 class LightRAGRetriever:
@@ -66,12 +77,21 @@ class LightRAGRetriever:
         vector_retriever: VectorRetriever,
         graph_retriever: GraphRetriever,
         keyword_extractor: QueryKeywordExtractor | None = None,
+        query_analyzer: QueryAnalyzer | None = None,
         config: LightRAGRetrievalConfig | None = None,
     ):
         self.vector_retriever = vector_retriever
         self.graph_retriever = graph_retriever
         self.keyword_extractor = keyword_extractor or QueryKeywordExtractor()
+        self.query_analyzer = query_analyzer or QueryAnalyzer()
         self.config = config or LightRAGRetrievalConfig()
+        self.graph_scorer = GraphQueryScorer()
+        self.evidence_expander = GraphEvidenceExpander(
+            graph_repo=self.graph_retriever.graph_repo,
+            config=self.config.evidence_expansion or EvidenceExpansionConfig(
+                max_total_chunks=self.config.max_chunks,
+            ),
+        )
 
     def retrieve(self, query: str) -> RetrievalResult:
         raw_keywords = self.keyword_extractor.extract(query)
@@ -79,36 +99,50 @@ class LightRAGRetriever:
         # deduped keyword text here; dynamic genericness is applied after entity
         # linking using chunk mention frequency from Neo4j.
         keywords = self._clean_keywords(raw_keywords)
-        intent = self._infer_intent(query, keywords)
-        intent_relation_types = self._infer_relation_types(query, keywords, intent=intent)
-        low_query = keywords.low_query_text() or query
-        high_query = keywords.high_query_text() or query
-        if intent == "symptom_diagnosis":
-            # Do not let bad fallback high-level keywords such as "phân loại"
-            # drive relation search for patient symptom questions. In LightRAG
-            # terms, this keeps the global/relation query aligned with the
-            # user's diagnostic intent instead of drifting to taxonomy edges.
-            high_query = "triệu chứng; biểu hiện; yếu tố liên quan; dị ứng"
+        analysis = self.query_analyzer.analyze(query, keywords)
+        intent = analysis.intent
+        profile = self.graph_scorer.build_query_anchor_profile(query, keywords, analysis)
+        intent_relation_types = self._infer_relation_types(query, keywords, analysis=analysis)
+
+        phrase_queries = self.graph_scorer.select_search_phrases(
+            profile,
+            limit=max(0, int(self.config.query_phrase_query_top_k)),
+        )
+        low_query = "; ".join(self._dedupe_keyword_text([
+            keywords.low_query_text(),
+            *phrase_queries,
+            query,
+        ])) or query
+        high_query = "; ".join(self._dedupe_keyword_text([
+            keywords.high_query_text(),
+            *phrase_queries,
+            query,
+        ])) or query
 
         entity_hits = self.vector_retriever.search_entities(
             low_query,
             top_k=self.config.entity_top_k,
         )
         entity_hits, entity_specificity_debug = self._apply_entity_specificity(
-            self._dedupe_entities(entity_hits)
+            self._dedupe_entities(entity_hits),
+            query=query,
+            keywords=keywords,
         )
         entity_seed_ids = [e.entity_id for e in entity_hits]
+        entity_seed_scores = {e.entity_id: float(e.score or 0.0) for e in entity_hits}
 
         relation_hits = self.vector_retriever.search_relations(
             high_query,
-            top_k=self.config.relation_top_k,
+            top_k=max(self.config.relation_top_k, self.config.relation_top_k * self.config.relation_candidate_multiplier),
         )
-        relation_hits = self._filter_relations(
+        relation_hits, relation_anchor_debug = self._rerank_relations_by_anchor(
             relation_hits,
-            allowed_relation_types=intent_relation_types,
-            seed_entity_ids=set(entity_seed_ids),
+            query=query,
+            keywords=keywords,
+            analysis=analysis,
+            seed_entity_scores=entity_seed_scores,
         )
-        relation_hits, relation_specificity_debug = self._apply_relation_endpoint_specificity(relation_hits)
+        relation_hits = relation_hits[: self.config.relation_top_k]
         relation_seed_ids = [r.relation_id for r in relation_hits]
 
         graph_from_entities = self.graph_retriever.retrieve_from_entity_ids(
@@ -134,14 +168,12 @@ class LightRAGRetriever:
             relations=base_relations,
             seed_entity_ids=set(entity_seed_ids),
             intent=intent,
+            analysis=analysis,
         )
         disease_ids = [entity_id for entity_id, _ in disease_candidates[: self.config.disease_candidate_top_k]]
 
         graph_from_diseases = RetrievalResult(query=query, method="graph_disease")
-        if disease_ids and (
-            intent == "symptom_diagnosis"
-            and self.config.disease_candidate_first_for_symptom_queries
-        ):
+        if disease_ids and self.config.enable_data_driven_disease_candidates:
             graph_from_diseases = self.graph_retriever.retrieve_from_entity_ids(
                 query=query,
                 entity_ids=disease_ids,
@@ -163,8 +195,27 @@ class LightRAGRetriever:
             + graph_from_relations.chunks
             + graph_from_diseases.chunks
         )
-        if intent == "symptom_diagnosis" and disease_candidates:
+        if self.config.enable_data_driven_disease_candidates and disease_candidates:
             chunks = self._rerank_chunks_by_disease_candidates(chunks, relations, disease_candidates)
+        if self.config.enable_query_anchor_chunk_rerank:
+            relation_chunk_boost = self._relation_chunk_boost(relations, analysis)
+            chunks = self.graph_scorer.rerank_chunks(
+                chunks,
+                query=query,
+                keywords=keywords,
+                analysis=analysis,
+                relation_chunk_boost=relation_chunk_boost,
+            )
+
+        expansion_debug = {"enabled": False}
+        if self.config.enable_evidence_expansion:
+            chunks, expansion_debug = self.evidence_expander.expand_chunks(
+                query=query,
+                chunks=chunks,
+                entities=entities,
+                relations=relations,
+                analysis=analysis,
+            )
 
         return RetrievalResult(
             query=query,
@@ -178,8 +229,16 @@ class LightRAGRetriever:
                 "raw_high_keywords": raw_keywords.high_level_keywords,
                 "low_query": low_query,
                 "high_query": high_query,
+                "query_anchor_profile": {
+                    **self.graph_scorer.profile_debug(profile, max_terms=12),
+                    "selected_search_phrases": phrase_queries,
+                },
                 "intent": intent,
+                "intent_confidence": analysis.confidence,
+                "intent_cues": analysis.cues,
+                "intent_relation_boosts": analysis.relation_type_boosts,
                 "intent_relation_types": intent_relation_types,
+                "evidence_expansion": expansion_debug,
                 "disease_candidate_first": bool(disease_candidates),
                 "top_disease_candidates": [
                     {"entity_id": entity_id, "score": score}
@@ -188,10 +247,11 @@ class LightRAGRetriever:
                 "entity_seed_count": len(entity_hits),
                 "relation_seed_count": len(relation_hits),
                 "entity_specificity": entity_specificity_debug,
-                "relation_endpoint_specificity": relation_specificity_debug,
-                "genericness_strategy": "dynamic_chunk_document_frequency",
+                "relation_anchor_rerank": relation_anchor_debug,
+                "genericness_strategy": "dynamic_idf_anchor_aware",
                 "synonym_expand": self.config.synonym_expand,
                 "endpoint_constraint": self.config.constrain_relation_endpoints_to_entity_seeds,
+                "graph_confidence": self.graph_scorer.branch_confidence(chunks, query, keywords),
             },
         )
 
@@ -226,7 +286,10 @@ class LightRAGRetriever:
     def _apply_entity_specificity(
         self,
         entities: list[RetrievedEntity],
-    ) -> tuple[list[RetrievedEntity], dict[str, dict[str, float | int | bool]]]:
+        *,
+        query: str,
+        keywords: QueryKeywords,
+    ) -> tuple[list[RetrievedEntity], dict[str, dict[str, float | int | bool | list[str]]]]:
         if not self.config.apply_node_specificity or not entities:
             return entities, {}
 
@@ -234,27 +297,35 @@ class LightRAGRetriever:
         chunk_counts = self.graph_retriever.graph_repo.get_entity_chunk_counts(entity_ids)
         total_chunks = max(int(self.graph_retriever.graph_repo.get_graph_stats().get("chunk_count", 0) or 0), 1)
 
-        debug: dict[str, dict[str, float | int | bool]] = {}
+        debug: dict[str, dict[str, float | int | bool | list[str]]] = {}
         adjusted: list[RetrievedEntity] = []
 
         for entity in entities:
             chunk_count = max(int(chunk_counts.get(entity.entity_id, 1) or 1), 1)
-            specificity = max(1.0 / float(chunk_count), self.config.node_specificity_min)
+            specificity = max(
+                self.graph_scorer.node_specificity(chunk_count, total_chunks),
+                self.config.node_specificity_min,
+            )
+            anchor_multiplier, anchor_reasons = self.graph_scorer.entity_anchor_multiplier(entity, query, keywords)
             chunk_ratio = float(chunk_count) / float(total_chunks)
             original_score = float(entity.score or 0.0)
-            entity.score = original_score * specificity
+            entity.score = original_score * specificity * anchor_multiplier
             entity.metadata = {
                 **dict(entity.metadata or {}),
                 "original_score": original_score,
                 "chunk_document_frequency": chunk_count,
                 "chunk_document_ratio": chunk_ratio,
                 "node_specificity": specificity,
+                "anchor_multiplier": anchor_multiplier,
+                "anchor_reasons": anchor_reasons,
                 "frequency_generic": chunk_ratio >= self.config.generic_chunk_ratio_threshold,
             }
             debug[entity.entity_id] = {
                 "chunk_count": chunk_count,
                 "chunk_ratio": chunk_ratio,
                 "specificity": specificity,
+                "anchor_multiplier": anchor_multiplier,
+                "anchor_reasons": anchor_reasons,
                 "original_score": original_score,
                 "adjusted_score": entity.score,
                 "frequency_generic": chunk_ratio >= self.config.generic_chunk_ratio_threshold,
@@ -310,6 +381,48 @@ class LightRAGRetriever:
 
         return sorted(adjusted, key=lambda item: item.score, reverse=True), debug
 
+    def _rerank_relations_by_anchor(
+        self,
+        relations: list[RetrievedRelation],
+        *,
+        query: str,
+        keywords: QueryKeywords,
+        analysis,
+        seed_entity_scores: dict[str, float],
+    ) -> tuple[list[RetrievedRelation], dict[str, dict[str, float | list[str]]]]:
+        if not relations:
+            return relations, {}
+
+        endpoint_ids = list(
+            dict.fromkeys(
+                entity_id
+                for relation in relations
+                for entity_id in [relation.subject_entity_id, relation.object_entity_id]
+                if entity_id
+            )
+        )
+        chunk_counts = self.graph_retriever.graph_repo.get_entity_chunk_counts(endpoint_ids)
+        total_chunks = max(int(self.graph_retriever.graph_repo.get_graph_stats().get("chunk_count", 0) or 0), 1)
+        return self.graph_scorer.rerank_relations(
+            relations,
+            seed_entity_scores=seed_entity_scores,
+            chunk_counts=chunk_counts,
+            total_chunks=total_chunks,
+            analysis=analysis,
+            query=query,
+            keywords=keywords,
+        )
+
+    def _relation_chunk_boost(self, relations: list[RetrievedRelation], analysis) -> dict[str, float]:
+        result: dict[str, float] = defaultdict(float)
+        boosts = getattr(analysis, "relation_type_boosts", {}) or {}
+        for relation in relations:
+            relation_weight = float(boosts.get(relation.relation_type, 1.0))
+            for chunk_id in relation.evidence_chunk_ids:
+                if chunk_id:
+                    result[chunk_id] += float(relation.score or 0.0) * 0.15 * relation_weight
+        return result
+
     def _filter_relations(
         self,
         relations: list[RetrievedRelation],
@@ -329,95 +442,58 @@ class LightRAGRetriever:
             if r.subject_entity_id in seed_entity_ids or r.object_entity_id in seed_entity_ids
         ]
 
-        # Avoid catastrophic empty results when entity vector linking is weak.
-        return endpoint_filtered or type_filtered
+        # If high-level relation hits do not overlap local entity seeds, keep a
+        # very small fallback rather than all type-filtered hits. Returning the
+        # full list is a common source of global-search drift.
+        if endpoint_filtered:
+            return endpoint_filtered
+        return type_filtered[: max(3, min(5, self.config.relation_top_k))]
 
     def _infer_intent(self, query: str, keywords: QueryKeywords) -> str:
-        text = self._norm(" ".join([query] + keywords.low_level_keywords + keywords.high_level_keywords))
-        if any(
-            cue in text
-            for cue in [
-                "co the la",
-                "benh gi",
-                "van de gi",
-                "nen nghi",
-                "nen kham",
-                "khong biet",
-                "goi y",
-                "toi bi",
-                "con toi",
-            ]
-        ):
-            return "symptom_diagnosis"
-        if any(cue in text for cue in ["phan biet", "de nham", "nham voi"]):
-            return "differential"
-        if any(cue in text for cue in ["bien chung", "dan toi", "gay ra", "nguy hiem"]):
-            return "complication"
-        if any(cue in text for cue in ["dang", "the", "loai", "phan loai"]):
-            return "taxonomy"
-        if any(cue in text for cue in ["con goi", "ten khac", "dong nghia", "tieng anh", "aka"]):
-            return "synonym"
-        return "general_fact"
+        # Kept only for backwards compatibility. Intent is produced by
+        # QueryAnalyzer, which is schema-neutral in the no-hard-coded-features
+        # path.
+        return "schema_neutral"
 
-    def _infer_relation_types(self, query: str, keywords: QueryKeywords, intent: str | None = None) -> list[str] | None:
+    def _infer_relation_types(self, query: str, keywords: QueryKeywords, analysis) -> list[str] | None:
         if not self.config.constrain_relation_types_by_intent:
             return None
-
-        text = self._norm(" ".join([query] + keywords.low_level_keywords + keywords.high_level_keywords))
-        relation_types: list[str] = []
-
-        def add(*values: str) -> None:
-            for value in values:
-                if value not in relation_types:
-                    relation_types.append(value)
-
-        if intent == "symptom_diagnosis":
-            # For patient symptom questions, keep LightRAG global retrieval on
-            # disease-symptom/trigger edges. Do not allow taxonomy/treatment
-            # relation types from noisy high-level keywords to dominate.
-            add("CO_BIEU_HIEN", "LIEN_QUAN_YEU_TO", "ANH_HUONG_DEN", "CHAN_DOAN_PHAN_BIET_VOI")
-            return relation_types
-
-        if any(cue in text for cue in ["trieu chung", "bieu hien", "dau hieu", "ngua", "kho tho", "kho khe", "ho"]):
-            add("CO_BIEU_HIEN", "ANH_HUONG_DEN")
-        if any(cue in text for cue in ["nguyen nhan", "yeu to", "lien quan", "di ung", "bui", "phan hoa", "long thu", "mat bui"]):
-            add("LIEN_QUAN_YEU_TO")
-        if any(cue in text for cue in ["bien chung", "dan toi", "gay ra", "nguy hiem"]):
-            add("GAY_BIEN_CHUNG")
-        if any(cue in text for cue in ["phan biet", "de nham", "nham voi", "chan doan"]):
-            add("CHAN_DOAN_PHAN_BIET_VOI", "CHAN_DOAN_BANG")
-        if any(cue in text for cue in ["dieu tri", "chua", "thuoc", "boi", "uong"]):
-            add("DIEU_TRI_BANG")
-        if any(cue in text for cue in ["phong ngua", "phong tranh"]):
-            add("PHONG_NGUA_BANG")
-        if any(cue in text for cue in ["tranh", "kieng"]):
-            add("CAN_TRANH")
-        if any(cue in text for cue in ["dang", "the", "loai", "phan loai"]):
-            add("LA_DANG_CUA")
-        if any(cue in text for cue in ["con goi", "ten khac", "dong nghia", "tieng anh", "aka"]):
-            add("DONG_NGHIA_VOI")
-
-        return relation_types or None
+        boosted = list(getattr(analysis, "boosted_relation_types", lambda: [])() or [])
+        return boosted or None
 
 
-    def _relation_weights(self) -> dict[str, float]:
-        return self.config.disease_relation_weights or {
-            "CO_BIEU_HIEN": 2.4,
-            "LIEN_QUAN_YEU_TO": 1.2,
-            "ANH_HUONG_DEN": 0.8,
-            "CHAN_DOAN_PHAN_BIET_VOI": 0.6,
-        }
+    def _relation_weights(self, relations: list[RetrievedRelation] | None = None, analysis=None) -> dict[str, float]:
+        # Data-driven relation weighting: normalize observed relation scores by
+        # relation type inside the current candidate pool. No relation type is
+        # privileged by a hand-written map.
+        if not relations:
+            return {}
+        totals: dict[str, float] = defaultdict(float)
+        counts: dict[str, int] = defaultdict(int)
+        for relation in relations:
+            if not relation.relation_type:
+                continue
+            totals[relation.relation_type] += max(float(relation.score or 0.0), 0.0)
+            counts[relation.relation_type] += 1
+        if not totals:
+            return {}
+        means = {key: totals[key] / max(counts[key], 1) for key in totals}
+        max_mean = max(means.values()) if means else 0.0
+        if max_mean <= 0.0:
+            return {key: 1.0 for key in means}
+        return {key: 0.5 + 0.5 * (value / max_mean) for key, value in means.items()}
 
     def _rank_disease_candidates(
         self,
         relations: list[RetrievedRelation],
         seed_entity_ids: set[str],
         intent: str,
+        analysis=None,
     ) -> list[tuple[str, float]]:
-        if intent != "symptom_diagnosis" or not relations:
+        if not relations:
             return []
 
-        weights = self._relation_weights()
+        weights = self._relation_weights(relations, analysis)
         scores: dict[str, float] = defaultdict(float)
         evidence_counts: dict[str, int] = defaultdict(int)
 
@@ -446,9 +522,8 @@ class LightRAGRetriever:
             scores[disease_id] += base * weight * seed_multiplier
             evidence_counts[disease_id] += 1
 
-        # Reward diseases supported by multiple matched relations. This helps
-        # asthma beat allergic rhinitis when the query contains several lower
-        # respiratory symptoms, not just generic allergens.
+        # Reward diseases supported by multiple matched relations. The support
+        # count is structural, not tied to any lexical cue list.
         for disease_id, count in evidence_counts.items():
             scores[disease_id] *= 1.0 + min(count, 4) * 0.12
 

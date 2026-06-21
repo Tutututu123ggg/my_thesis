@@ -27,6 +27,14 @@ class MedicalAnswerConfig:
     max_relations: int = 40
     max_chunks: int = 8
     context_mode: Literal["chunks_only", "full_graph"] = "chunks_only"
+
+    # Optional context compaction. This does not change retrieval ranking; it
+    # only makes the evidence sent to the answer generator more focused.
+    enable_evidence_selection: bool = True
+    evidence_max_sentences_per_chunk: int = 3
+    evidence_sentence_window_size: int = 1
+    evidence_max_compact_chars_per_chunk: int = 1400
+
     system_prompt: str = (
         "Bạn là trợ lý RAG y khoa tiếng Việt. Chỉ dùng context được cung cấp. "
         "Không chẩn đoán chắc chắn; chỉ nêu khả năng liên quan và khuyến nghị đi khám khi cần."

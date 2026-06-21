@@ -162,25 +162,52 @@ def _section_text_with_heading(section: SectionDocument) -> str:
     return "\n".join(lines).strip()
 
 
+def _heading_path_text(path: list[str] | None) -> str:
+    values = [item.strip() for item in (path or []) if item and item.strip()]
+    return " > ".join(values)
+
+
+def _heading_path_for_packed_chunk(sections: list[SectionDocument]) -> list[str]:
+    """Return active parent heading path at the start of a packed chunk.
+
+    The first section heading itself is already inserted into the raw chunk text
+    by ``_section_text_with_heading``. Therefore the context prefix only needs
+    its ancestors, e.g. title + ["1. Nguyên nhân", "1.1. Yếu tố môi trường"]
+    for a chunk beginning at heading "1.1.3. Xà phòng".
+    """
+    if not sections:
+        return []
+    path = list(sections[0].heading_path or [])
+    return path[:-1] if path else []
+
+
+def _heading_path_for_single_split(section: SectionDocument) -> list[str]:
+    """Return full active heading path for a split long section.
+
+    Split chunks do not contain the section heading in raw text, so the current
+    heading must remain in the prefix.
+    """
+    return list(section.heading_path or [])
+
+
 def build_contextualized_text(
     article: ArticleDocument,
     section: SectionDocument,
     text: str,
 ) -> str:
     """
-    Tạo text có context cho một chunk chứa một section.
+    Tạo text có context cho một chunk chứa một phần của một section dài.
 
-    Hàm này được giữ để tương thích với code cũ và dùng cho section quá dài
-    phải split theo paragraph/sentence.
+    Raw chunk vẫn giữ nguyên ở ``ChunkDocument.text``. Contextualized text chỉ
+    dùng cho embedding/extraction để LLM không mất heading ancestry.
     """
-    lines = [
-        f"Bài viết: {article.title}",
-    ]
+    heading_path = _heading_path_for_single_split(section)
+    lines = [f"Bài viết: {article.title}"]
 
-    if section.parent_section_title:
-        lines.append(f"Mục lớn: {section.parent_section_title}")
+    heading_path_text = _heading_path_text(heading_path)
+    if heading_path_text:
+        lines.append(f"Đường dẫn mục tại đầu chunk: {heading_path_text}")
 
-    lines.append(f"Mục: {section.section_title}")
     lines.append("")
     lines.append(text.strip())
 
@@ -195,19 +222,47 @@ def build_packed_contextualized_text(
     """
     Tạo contextualized_text cho chunk chứa nhiều section liền kề.
 
-    Giữ title bài viết + danh sách mục để extractor có context tổng quát,
-    còn phần text bên dưới vẫn giữ heading Markdown từng section.
+    Chỉ thêm title + heading ancestors active ở điểm bắt đầu chunk. Các heading
+    mới xuất hiện sau đó được giữ nguyên trong raw chunk text, nên không cần đưa
+    toàn bộ heading list vào context prefix.
     """
     lines = [f"Bài viết: {article.title}"]
 
-    section_titles = [section.section_title for section in sections]
-    if section_titles:
-        lines.append("Các mục trong chunk: " + " | ".join(section_titles))
+    heading_path = _heading_path_for_packed_chunk(sections)
+    heading_path_text = _heading_path_text(heading_path)
+    if heading_path_text:
+        lines.append(f"Đường dẫn mục tại đầu chunk: {heading_path_text}")
 
     lines.append("")
     lines.append(text.strip())
 
     return "\n".join(lines).strip()
+
+
+def build_chunk_trace_metadata(
+    article: ArticleDocument,
+    chunk_id: str,
+    chunk_index: int,
+) -> dict:
+    """Stable trace metadata copied to every chunk/vector/evidence payload.
+
+    Only article.body is chunked/embedded. Frontmatter fields stay metadata-only
+    so retrieval can cite/debug sources without polluting LLM extraction text.
+    """
+    metadata = dict(article.metadata or {})
+    return {
+        "source": article.source,
+        "source_domain": metadata.get("source_domain"),
+        "source_name": metadata.get("source_name"),
+        "url": article.url,
+        "title": article.title,
+        "published_at": article.published_at,
+        "category": article.category,
+        "document_id": article.article_id,
+        "article_id": article.article_id,
+        "chunk_id": chunk_id,
+        "chunk_index": chunk_index,
+    }
 
 
 def make_packed_chunk(
@@ -238,33 +293,42 @@ def make_packed_chunk(
     section_titles = [section.section_title for section in sections]
     section_ids = [section.section_id for section in sections]
     section_orders = [section.order for section in sections]
+    section_heading_paths = [list(section.heading_path or []) for section in sections]
     parent_titles = [
         section.parent_section_title
         for section in sections
         if section.parent_section_title
     ]
+    heading_path_at_start = _heading_path_for_packed_chunk(sections)
+    heading_context = _heading_path_text(heading_path_at_start)
+
+    chunk_id = make_chunk_id(article.article_id, chunk_index, text)
+    metadata = {
+        **build_chunk_trace_metadata(article, chunk_id, chunk_index),
+        "section_ids": section_ids,
+        "section_titles": section_titles,
+        "section_orders": section_orders,
+        "section_heading_paths": section_heading_paths,
+        "section_count": len(sections),
+        "parent_section_titles": list(dict.fromkeys(parent_titles)),
+        "heading_path_at_chunk_start": heading_path_at_start,
+        "heading_path_context": heading_context,
+        "chunking_strategy": "section_preserving_pack",
+    }
 
     return ChunkDocument(
-        chunk_id=make_chunk_id(article.article_id, chunk_index, text),
+        chunk_id=chunk_id,
         article_id=article.article_id,
         source_url=article.url,
         title=article.title,
         section=" | ".join(section_titles),
         subsection=None,
         chunk_index=chunk_index,
+        heading_path=heading_path_at_start,
         text=text,
         contextualized_text=contextualized_text,
         token_count=estimate_token_count(contextualized_text),
-        metadata={
-            "section_ids": section_ids,
-            "section_titles": section_titles,
-            "section_orders": section_orders,
-            "section_count": len(sections),
-            "parent_section_titles": list(dict.fromkeys(parent_titles)),
-            "chunking_strategy": "section_preserving_pack",
-            "source": article.source,
-            "category": article.category,
-        },
+        metadata=metadata,
     )
 
 
@@ -287,30 +351,37 @@ def make_single_section_chunk(
         text=text,
     )
 
+    heading_path = _heading_path_for_single_split(section)
+    heading_context = _heading_path_text(heading_path)
+
+    chunk_id = make_chunk_id(article.article_id, chunk_index, text)
     metadata = {
+        **build_chunk_trace_metadata(article, chunk_id, chunk_index),
         "section_id": section.section_id,
         "section_level": section.section_level,
         "section_order": section.order,
         "section_ids": [section.section_id],
         "section_titles": [section.section_title],
         "section_orders": [section.order],
+        "section_heading_paths": [heading_path],
         "section_count": 1,
+        "heading_path_at_chunk_start": heading_path,
+        "heading_path_context": heading_context,
         "chunking_strategy": "single_long_section_split" if part_index is not None else "single_section",
-        "source": article.source,
-        "category": article.category,
     }
 
     if part_index is not None:
         metadata["section_part_index"] = part_index
 
     return ChunkDocument(
-        chunk_id=make_chunk_id(article.article_id, chunk_index, text),
+        chunk_id=chunk_id,
         article_id=article.article_id,
         source_url=article.url,
         title=article.title,
         section=section.parent_section_title or section.section_title,
         subsection=section.section_title if section.parent_section_title else None,
         chunk_index=chunk_index,
+        heading_path=heading_path,
         text=text,
         contextualized_text=contextualized_text,
         token_count=estimate_token_count(contextualized_text),
