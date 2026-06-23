@@ -151,10 +151,11 @@ def clean_retrieval_keywords(values: list[str] | tuple[str, ...] | None, *, limi
 def deterministic_relation_keywords(relation: ExtractedRelation, *, extra_keywords: list[str] | None = None) -> list[str]:
     """Safe fallback for relation retrieval keywords.
 
-    The extractor/LLM is no longer trusted to create final LightRAG relation
-    keys. This fallback uses only relation endpoints and schema-level intent;
-    it never mines arbitrary n-grams from evidence, which prevents clause
-    fragments such as "neu griseofulvin khong" from leaking into Neo4j/Qdrant.
+    This is intentionally small. The preferred source is the article-level LLM
+    keyword profiler. When that profiler is disabled or returns nothing, keep
+    only endpoint names and a short natural-language relation intent. Avoid
+    mining arbitrary n-grams from evidence because those produced noisy keyword
+    strings in graph audits.
     """
 
     intent = get_relation_keyword_intent(relation.relation_type, default="")
@@ -162,24 +163,14 @@ def deterministic_relation_keywords(relation: ExtractedRelation, *, extra_keywor
         relation.subject,
         relation.object,
         intent,
-        *RELATION_INTENT_EXTRAS.get(relation.relation_type, []),
     ]
 
-    if relation.relation_type == "DIEU_TRI_BANG":
-        if relation.object_type == "THUOC_VA_HOAT_CHAT":
-            candidates.append("thuốc điều trị")
-            candidates.append("thuốc y khoa")
-        if relation.object_type == "CAN_THIEP_Y_TE":
-            candidates.append("can thiệp điều trị")
-    elif relation.relation_type == "LIEN_QUAN_YEU_TO":
-        if relation.object_type == "YEU_TO_BENH_SINH":
-            candidates.append("cơ chế bệnh sinh")
-        if relation.object_type == "YEU_TO_NGOAI_SINH":
-            candidates.append("yếu tố môi trường")
-    elif relation.relation_type == "CO_BIEU_HIEN":
-        candidates.append(f"triệu chứng {relation.subject}")
-    elif relation.relation_type == "CHAN_DOAN_BANG":
-        candidates.append(f"chẩn đoán {relation.subject}")
+    # Anchor the intent with the main subject when it remains short. This keeps
+    # fallback keywords retrieval-friendly without a hand-written medical dict.
+    if intent and relation.subject:
+        anchored = f"{intent} {relation.subject}"
+        if len(anchored.split()) <= MAX_KEYWORD_WORDS:
+            candidates.append(anchored)
 
     candidates.extend(extra_keywords or [])
     return clean_retrieval_keywords(candidates, limit=8)
@@ -394,68 +385,57 @@ Output JSON duy nhất:
 }
 
 Mục tiêu keyword:
-- Keyword dùng để tìm lại relation khi user hỏi bằng cách diễn đạt khác.
-- Keyword phải là cụm y khoa/ngữ nghĩa truy hồi, không phải câu văn copy từ evidence.
-- Ưu tiên keyword giúp nối query với subject, object, relation intent, cơ chế, vị trí, mức độ, nhóm thuốc, phương pháp.
+- Keyword là nhãn truy hồi ngắn cho relation, không phải evidence.
+- Keyword có thể generic vừa đủ nếu giúp retrieval, ví dụ: "da liễu", "nấm da", "bệnh móng", "thuốc kháng nấm".
+- Keyword cũng nên có cụm specific theo subject/object, ví dụ: "điều trị lang ben", "soi tươi KOH", "itraconazole".
+- Mỗi relation nên có 4-8 keywords.
 
-Quy tắc:
-- Mỗi keyword tối đa 5 từ.
-- Mỗi relation nên có 3-8 keywords.
-- Không sinh câu hoàn chỉnh hoặc mảnh câu điều kiện.
-- Không copy cụm như: "nếu", "có thể", "không có", "người bệnh", "được sử dụng", "bao gồm".
+Quy tắc format bắt buộc:
+- Mỗi phần tử trong keywords là MỘT keyword riêng.
+- Không nhét nhiều keyword vào một string bằng dấu phẩy.
+- Mỗi keyword thường tối đa 5 từ; tên bệnh/thuốc/phương pháp dài có thể tối đa 6 từ.
+- Không copy nguyên câu evidence, không sinh mảnh câu dài.
 - Không dùng schema enum như BENH_LY, CO_BIEU_HIEN, DIEU_TRI_BANG.
 - Không thêm fact y khoa mới xa evidence.
 - Không trả markdown, không giải thích.
 
-Ví dụ tốt:
+Few-shot tốt/xấu:
 
-1. Relation:
-subject="nấm lang ben", relation_type="DIEU_TRI_BANG", object="ketoconazole"
-evidence="Kết hợp với bôi kem trị nấm như ketoconazole, Clotrimazole, Terbinafine."
+Ví dụ 1
+Relation:
+subject="nấm lang ben", relation_type="DIEU_TRI_BANG", object="itraconazole"
+evidence="Chỉ định uống các thuốc kháng nấm như Gricin, ketoconazole, itraconazole, fluconazole..."
 keywords tốt:
-["kem bôi trị nấm", "điều trị tại chỗ", "thuốc chống nấm", "azole", "điều trị lang ben"]
+["da liễu", "nấm da", "lang ben", "điều trị lang ben", "thuốc kháng nấm", "itraconazole", "thuốc đường uống"]
+keywords xấu:
+["itraconazole sporanox onmel dạng", "chỉ định uống các thuốc kháng nấm như", "người bệnh sử dụng thuốc theo chỉ định"]
 
-2. Relation:
-subject="lác đồng tiền", relation_type="CO_BIEU_HIEN", object="ngứa dữ dội"
-evidence="Lác đồng tiền có thể khiến người bệnh ngứa dữ dội, nhất là khi ra mồ hôi."
+Ví dụ 2
+Relation:
+subject="nấm da đầu", relation_type="PHONG_NGUA_BANG", object="lau khô hoặc sấy khô đầu sau khi gội"
+evidence="Việc lau khô hoặc sấy khô đầu sau khi gội là rất quan trọng để hạn chế sự ẩm ướt trên da đầu..."
 keywords tốt:
-["ngứa dữ dội", "triệu chứng hắc lào", "ngứa khi ra mồ hôi", "biểu hiện nấm da"]
+["da liễu", "nấm da đầu", "phòng ngừa nấm da đầu", "vệ sinh da đầu", "giữ da đầu khô", "lau khô sau gội"]
+keywords xấu:
+["tạo điều kiện thuận lợi cho vi khuẩn và nấm phát triển", "việc lau khô hoặc sấy khô đầu sau khi gội là rất quan trọng"]
 
-3. Relation:
-subject="ngứa dữ dội", relation_type="DIEU_TRI_BANG", object="thuốc kháng Histamine"
-evidence="Thuốc kháng Histamine giúp cải thiện tình trạng ngứa dữ dội."
+Ví dụ 3
+Relation:
+subject="nấm móng tay", relation_type="LIEN_QUAN_YEU_TO", object="vẩy nến"
+evidence="Da xung quanh hoặc móng tay có vết tổn thương nhỏ hoặc đang mắc bệnh về da như vẩy nến."
 keywords tốt:
-["giảm ngứa", "kháng Histamine", "kiểm soát ngứa", "điều trị triệu chứng"]
+["da liễu", "nấm móng", "bệnh móng", "vẩy nến", "yếu tố nguy cơ", "bệnh da liên quan"]
+keywords xấu:
+["da xung quanh hoặc móng tay có vết tổn thương nhỏ", "đang mắc bệnh về da như"]
 
-4. Relation:
-subject="nấm da đầu", relation_type="LIEN_QUAN_YEU_TO", object="Trichophyton"
-evidence="Các loại nấm thuộc nhóm Dermatophytes, đặc biệt là chi Trichophyton, Microsporum và Epidermophyton, được xem là nguyên nhân chính gây ra bệnh nấm da đầu."
-keywords tốt:
-["nấm Dermatophytes", "nguyên nhân nấm da đầu", "vi nấm gây bệnh", "Trichophyton"]
-
-5. Relation:
+Ví dụ 4
+Relation:
 subject="lang ben", relation_type="CHAN_DOAN_BANG", object="đèn Wood"
 evidence="Đèn Wood sử dụng ánh sáng tia cực tím khi chiếu lên da sẽ xuất hiện màu vàng xanh nếu vùng đó mắc bệnh lang ben."
 keywords tốt:
-["đèn Wood", "chẩn đoán lang ben", "ánh sáng tia cực tím", "huỳnh quang vàng xanh"]
+["da liễu", "lang ben", "chẩn đoán lang ben", "đèn Wood", "tia cực tím", "huỳnh quang vàng xanh"]
+keywords xấu:
+["đèn Wood sử dụng ánh sáng tia cực tím khi chiếu lên da", "nếu vùng đó mắc bệnh"]
 
-6. Relation:
-subject="hắc lào", relation_type="CAN_TRANH", object="corticoid"
-evidence="Không tự ý dùng corticoid vì có thể làm bệnh nặng thêm."
-keywords tốt:
-["tránh corticoid", "lạm dụng corticoid", "bệnh nặng thêm", "điều trị sai cách"]
-
-7. Relation:
-subject="nấm", relation_type="LIEN_QUAN_TRUC_TIEP_DEN", object="thời tiết nóng ẩm"
-evidence="Môi trường có độ ẩm cao, thời tiết nóng ẩm là điều kiện thuận lợi cho nấm phát triển."
-keywords tốt:
-["nấm phát triển", "môi trường ẩm", "thời tiết nóng ẩm", "điều kiện thuận lợi"]
-
-Ví dụ xấu, không được sinh:
-- "nếu griseofulvin không"
-- "có thể được"
-- "chúng bao gồm"
-- "người bệnh cần"
-- "các lựa chọn thay thế"
-- "sử dụng theo chỉ định"
+Luôn ưu tiên keyword sạch, ngắn, truy hồi được. Keyword hơi generic nhưng sạch thì tốt hơn keyword dài bẩn.
 """.strip()

@@ -1,3 +1,4 @@
+# Backward-compatible public API. Implementation is split into common/entity/relation/keyword/pipeline.
 from app.ingestion.extraction.extraction_models import (
     ExtractedEntity,
     ExtractedRelation,

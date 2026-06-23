@@ -27,6 +27,18 @@ class LLMExtractedEntity(BaseModel):
     evidence_text: str = Field(
         description="Đoạn bằng chứng ngắn từ chunk chứng minh entity này xuất hiện."
     )
+    is_anchor_candidate: bool = Field(
+        default=False,
+        description=(
+            "True nếu entity là khái niệm y khoa có thể hữu ích độc lập hoặc "
+            "có khả năng liên quan nhiều bệnh/tài liệu, ví dụ bệnh lý, thuốc, "
+            "phương pháp chẩn đoán, tác nhân bệnh sinh, triệu chứng đặc hiệu."
+        ),
+    )
+    anchor_reason: str = Field(
+        default="",
+        description="Lý do ngắn nếu is_anchor_candidate=true; để rỗng nếu không chắc.",
+    )
 
 
 class LLMExtractedRelation(BaseModel):
@@ -266,6 +278,8 @@ class LLMExtractedGraph(BaseModel):
                     surface_forms=[],
                     description=entity.description,
                     evidence_text=entity.evidence_text,
+                    is_anchor_candidate=entity.is_anchor_candidate,
+                    anchor_reason=entity.anchor_reason,
                 )
                 for entity in self.entities
             ],
@@ -287,6 +301,8 @@ class ExtractedEntity(BaseModel):
     surface_forms: list[str] = Field(default_factory=list)
     description: str = ""
     evidence_text: str
+    is_anchor_candidate: bool = False
+    anchor_reason: str = ""
 
 
 class ExtractedRelation(BaseModel):

@@ -3,7 +3,7 @@ from typing import Any
 
 from app.domain.medical_schema import (
     is_valid_entity_type,
-    is_valid_relation_schema,
+    is_valid_relation_by_schema_policy,
     looks_like_blocked_entity,
 )
 from app.infrastructure.graph_database import graph_queries as q
@@ -136,12 +136,12 @@ class GraphRepository:
         object_type: str,
     ) -> bool:
         """
-        Relation phải qua validator domain/range trước khi ghi.
+        Relation phải qua validator/policy mềm trước khi ghi.
         Return:
             True nếu ghi thành công.
             False nếu relation bị loại.
         """
-        if not is_valid_relation_schema(
+        if not is_valid_relation_by_schema_policy(
             relation_type=relation.relation_type,
             subject_type=subject_type,
             object_type=object_type,

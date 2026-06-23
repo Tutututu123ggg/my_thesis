@@ -1,3 +1,6 @@
+import re
+import unicodedata
+
 from app.infrastructure.graph_database import (
     GraphRepository,
     MedicalRelation,
@@ -7,17 +10,92 @@ from app.ingestion.extraction import (
     ExtractedGraph,
     ExtractedRelation,
 )
+from app.ingestion.extraction.keyword.keyword_profiler import clean_retrieval_keywords
 from app.ingestion.processing import ChunkDocument
-from app.ingestion.extraction.keyword_profiler import (
-    clean_retrieval_keywords,
-    deterministic_relation_keywords,
-)
 from app.ingestion.resolution import (
     EntityResolver,
     ResolvedEntity,
     make_relation_id,
 )
 from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
+
+
+def _normalize_key_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("đ", "d")
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _entity_key(name: str, entity_type: str) -> tuple[str, str]:
+    return (_normalize_key_text(name), str(entity_type or "").strip())
+
+
+def _is_keepable_anchor_entity(entity: ExtractedEntity) -> bool:
+    if not getattr(entity, "is_anchor_candidate", False):
+        return False
+
+    if entity.entity_type in {
+        "BENH_LY",
+        "THUOC_VA_HOAT_CHAT",
+        "PHUONG_PHAP_CHAN_DOAN",
+        "YEU_TO_BENH_SINH",
+    }:
+        return True
+
+    if entity.entity_type == "BIEU_HIEN_LAM_SANG" and len(str(entity.name or "").split()) >= 2:
+        return True
+
+    return False
+
+
+def _entities_selected_for_write(extracted_graph: ExtractedGraph) -> tuple[list[ExtractedEntity], dict[str, int]]:
+    """Persist relation endpoints + high-value anchor candidates only.
+
+    LLM may extract broad entity candidates to protect relation recall. Neo4j
+    should receive a pruned graph, not every candidate. Relation endpoints are
+    always kept; orphan candidates are kept only when explicitly/inferentially
+    marked as high-value anchors such as diseases, drugs, diagnostic methods,
+    pathogens, or specific clinical manifestations.
+    """
+    endpoint_keys: set[tuple[str, str]] = set()
+    for relation in extracted_graph.relations:
+        endpoint_keys.add(_entity_key(relation.subject, relation.subject_type))
+        endpoint_keys.add(_entity_key(relation.object, relation.object_type))
+
+    selected: list[ExtractedEntity] = []
+    seen: set[tuple[str, str]] = set()
+    endpoint_count = 0
+    anchor_count = 0
+    pruned_count = 0
+
+    for entity in extracted_graph.entities:
+        key = _entity_key(entity.name, entity.entity_type)
+        if not key[0] or key in seen:
+            continue
+
+        is_endpoint = key in endpoint_keys
+        is_anchor = _is_keepable_anchor_entity(entity)
+
+        if is_endpoint or is_anchor:
+            selected.append(entity)
+            seen.add(key)
+            if is_endpoint:
+                endpoint_count += 1
+            elif is_anchor:
+                anchor_count += 1
+        else:
+            pruned_count += 1
+
+    return selected, {
+        "candidate_entity_count": len(extracted_graph.entities),
+        "selected_entity_count": len(selected),
+        "endpoint_entity_count": endpoint_count,
+        "kept_anchor_entity_count": anchor_count,
+        "pruned_orphan_candidate_count": pruned_count,
+    }
 
 
 class MedicalGraphBuilder:
@@ -45,7 +123,11 @@ class MedicalGraphBuilder:
         extracted_graph: ExtractedGraph,
     ) -> dict:
         """
-        Ghi toàn bộ entity/relation được extract từ một chunk.
+        Ghi graph đã prune từ một chunk.
+
+        Entity candidates có thể rộng để tăng recall, nhưng Neo4j chỉ nhận:
+        - entity là endpoint của relation hợp lệ; hoặc
+        - entity anchor có khả năng hữu ích độc lập.
 
         Return thống kê để print/debug.
         """
@@ -60,15 +142,17 @@ class MedicalGraphBuilder:
             }
 
         resolved_by_key: dict[tuple[str, str], ResolvedEntity] = {}
+        entities_to_write, prune_stats = _entities_selected_for_write(extracted_graph)
 
         entity_write_count = 0
         mention_write_count = 0
 
-        for entity in extracted_graph.entities:
+        for entity in entities_to_write:
             resolved = self.resolver.resolve(entity)
 
-            # Dùng cả key gốc và key normalized để relation endpoint dễ tìm.
+            # Dùng cả key gốc và normalized key để relation endpoint dễ tìm.
             resolved_by_key[(entity.name, entity.entity_type)] = resolved
+            resolved_by_key[_entity_key(entity.name, entity.entity_type)] = resolved
 
             node = self.resolver.to_entity_node(
                 resolved,
@@ -117,9 +201,18 @@ class MedicalGraphBuilder:
                 object_entity_id=object_.entity_id,
             )
 
-            relation_keywords = clean_retrieval_keywords(relation.keywords, limit=8)
+            keyword_profile = self.keyword_profiles.generate_relation_profile(
+                relation_type=relation.relation_type,
+                subject_name=subject.name,
+                subject_type=subject.entity_type,
+                object_name=object_.name,
+                object_type=object_.entity_type,
+                description=relation.description,
+                evidence_text=relation.evidence_text,
+            )
+            relation_keywords = clean_retrieval_keywords(relation.keywords or [], limit=8)
             if not relation_keywords:
-                relation_keywords = deterministic_relation_keywords(relation)
+                relation_keywords = clean_retrieval_keywords(keyword_profile.keywords, limit=8)
 
             medical_relation = MedicalRelation(
                 relation_id=relation_id,
@@ -137,7 +230,7 @@ class MedicalGraphBuilder:
                     "subsection": chunk.subsection,
                     "title": chunk.title,
                     "original_llm_keywords": relation.keywords,
-                    "keyword_policy": "article_keyword_profiler_or_deterministic_fallback",
+                    "keyword_policy": "article_llm_keywords_preferred_safe_fallback",
                 },
             )
 
@@ -157,6 +250,7 @@ class MedicalGraphBuilder:
             "relation_write_count": relation_write_count,
             "skipped_graph_ingest": False,
             "skip_reason": None,
+            **prune_stats,
         }
 
     def _resolve_relation_endpoint(
@@ -180,7 +274,7 @@ class MedicalGraphBuilder:
             name = relation.object
             entity_type = relation.object_type
 
-        direct = resolved_by_key.get((name, entity_type))
+        direct = resolved_by_key.get((name, entity_type)) or resolved_by_key.get(_entity_key(name, entity_type))
         if direct:
             return direct
 
@@ -191,6 +285,8 @@ class MedicalGraphBuilder:
             surface_forms=[name],
             description="",
             evidence_text=relation.evidence_text,
+            is_anchor_candidate=True,
+            anchor_reason="relation_endpoint",
         )
 
         resolved = self.resolver.resolve(temp_entity)

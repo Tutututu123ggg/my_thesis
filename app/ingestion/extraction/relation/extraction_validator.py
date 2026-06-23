@@ -22,15 +22,37 @@ from app.ingestion.extraction.keyword.keyword_profiler import (
 
 
 # Validator philosophy:
-# - LLM decides medical semantics.
-# - Validator only normalizes output and removes format/invariant errors.
-# - Do not drop/remap relations because their relation_type seems semantically imperfect.
-# - Keep recall high for GraphRAG; final grounding still comes from evidence passages.
+# - LLM decides most medical semantics.
+# - Validator normalizes output and removes format/invariant errors.
+# - Keep recall high: do not drop/remap relations only because relation_type is imperfect.
+# - But do hard-drop a few sure-wrong link patterns that repeatedly poison the graph
+#   (hospital promotion, diagnosis with a drug object, prevention pointing to pathogens, etc.).
 
-# If True, only entities that appear as endpoints of validated relations are kept.
-# False is safer for recall/debug because medical chunks with entities but no relations
-# will not become empty. Set True only when you intentionally want a strict triple-first KG.
+# Candidate extraction can be broad, but final graph writing must be pruned.
+# Validator keeps candidates for debugging; MedicalGraphBuilder persists only
+# relation endpoints plus high-value anchor candidates.
 KEEP_ONLY_RELATION_ENDPOINT_ENTITIES = False
+
+ANCHOR_ENTITY_TYPES = {
+    "BENH_LY",
+    "THUOC_VA_HOAT_CHAT",
+    "PHUONG_PHAP_CHAN_DOAN",
+    "YEU_TO_BENH_SINH",
+}
+
+NON_ANCHOR_ENTITY_NAMES = {
+    "người bệnh",
+    "bệnh nhân",
+    "trẻ em",
+    "trẻ",
+    "phụ huynh",
+    "cha mẹ",
+    "bác sĩ",
+    "khách hàng",
+    "bệnh viện",
+    "khoa da liễu",
+    "các thành viên trong gia đình",
+}
 
 
 GENERIC_KEYWORDS = {
@@ -44,6 +66,62 @@ GENERIC_KEYWORDS = {
     "yếu tố",
     "bệnh lý",
 }
+
+
+PROMOTIONAL_EVIDENCE_CUES = {
+    "bệnh viện",
+    "đội ngũ bác sĩ",
+    "khách hàng",
+    "hotline",
+    "tổng đài",
+    "đặt lịch",
+    "dịch vụ",
+    "thăm khám",
+    "tư vấn",
+    "myvinmec",
+    "medlatec",
+    "tâm anh",
+    "khoa da liễu",
+}
+
+AVOID_RELATION_CUES = {
+    "tránh",
+    "không nên",
+    "không tự ý",
+    "hạn chế",
+    "kiêng",
+    "không dùng",
+    "đừng",
+    "ngăn trẻ",
+    "ngăn bé",
+    "ngăn con",
+    "ngăn người bệnh",
+}
+
+COMPLICATION_CUES = {
+    "biến chứng",
+    "gây",
+    "dẫn đến",
+    "hậu quả",
+    "làm tăng nguy cơ",
+}
+
+PREVENTION_ACTION_CUES = (
+    "lau khô",
+    "sấy khô",
+    "vệ sinh",
+    "chăm sóc",
+    "giặt giũ",
+    "dọn dẹp",
+    "phơi đồ",
+    "không dùng chung",
+    "không sử dụng chung",
+    "cắt tóc",
+    "rửa sạch",
+    "giữ khô",
+    "tuân thủ",
+    "tái khám",
+)
 
 
 def normalize_name(name: str) -> str:
@@ -77,6 +155,159 @@ def schema_keyword_keys() -> set[str]:
 
 
 SCHEMA_KEYWORD_KEYS = schema_keyword_keys()
+
+
+def contains_any(text: str, cues) -> bool:
+    norm = str(text or "").lower()
+    return any(str(cue).lower() in norm for cue in cues)
+
+
+def infer_anchor_candidate(name: str, entity_type: str) -> tuple[bool, str]:
+    """Mark high-value standalone nodes without keeping generic or admin entities.
+
+    Broad entity extraction improves recall, but only relation endpoints and
+    high-value anchors should become persisted graph nodes.
+    """
+    cleaned_name = clean_entity_name(name)
+    norm = normalize_name(cleaned_name)
+
+    if not cleaned_name or norm in {normalize_name(item) for item in NON_ANCHOR_ENTITY_NAMES}:
+        return False, ""
+
+    if entity_type in ANCHOR_ENTITY_TYPES:
+        return True, f"anchor_type:{entity_type}"
+
+    if entity_type == "BIEU_HIEN_LAM_SANG" and len(cleaned_name.split()) >= 2:
+        return True, "specific_clinical_manifestation"
+
+    return False, ""
+
+
+def extract_prevention_action(evidence_text: str) -> str:
+    """Best-effort repair for prevention relations whose object is a pathogen/disease.
+
+    Example: instead of `nấm da đầu --PHONG_NGUA_BANG--> nấm`, repair to
+    `nấm da đầu --PHONG_NGUA_BANG--> lau khô hoặc sấy khô đầu sau khi gội`
+    when that action is present in the same evidence.
+    """
+    evidence = clean_short_text(evidence_text, max_chars=500)
+    if not evidence:
+        return ""
+
+    # Clause after modal/prevention verbs. Keep this deliberately simple and
+    # evidence-bound; no medical inference beyond the exact clause.
+    patterns = (
+        r"(?:nên|cần|phải)\s+([^.;:\n]{3,120})",
+        r"(?:để\s+(?:hạn chế|phòng ngừa|ngăn ngừa))[^,.;:]*,?\s*([^.;:\n]{3,120})",
+        r"việc\s+([^.;:\n]{3,120}?)\s+(?:là|rất|giúp|để)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, evidence, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = clean_entity_name(match.group(1))
+        candidate_lower = candidate.lower()
+        if len(candidate.split()) > 12:
+            candidate = " ".join(candidate.split()[:12])
+        if candidate and contains_any(candidate_lower, PREVENTION_ACTION_CUES):
+            return candidate
+
+    lowered = evidence.lower()
+    for cue in PREVENTION_ACTION_CUES:
+        idx = lowered.find(cue)
+        if idx < 0:
+            continue
+        tail = evidence[idx:]
+        tail = re.split(r"[.;\n]", tail, maxsplit=1)[0]
+        candidate = clean_entity_name(tail)
+        if len(candidate.split()) > 12:
+            candidate = " ".join(candidate.split()[:12])
+        if candidate:
+            return candidate
+
+    return ""
+
+
+def repair_relation_if_possible(
+    *,
+    subject: str,
+    subject_type: str,
+    relation_type: str,
+    object_: str,
+    object_type: str,
+    evidence_text: str,
+    description: str,
+    keywords: list[str],
+    confidence: float,
+) -> ExtractedRelation | None:
+    """Repair high-recall relations before dropping them.
+
+    Validator should be a guardrail, not only a guillotine. When LLM picked a
+    pathogen/disease as the object of a prevention relation, recover the actual
+    prevention action from the same evidence if it is explicit.
+    """
+    if relation_type == "PHONG_NGUA_BANG" and object_type in {"BENH_LY", "YEU_TO_BENH_SINH"}:
+        action = extract_prevention_action(evidence_text)
+        if action and not is_bad_entity_name(action):
+            return ExtractedRelation(
+                subject=subject,
+                subject_type=subject_type,
+                relation_type=relation_type,
+                object=action,
+                object_type="CAN_THIEP_Y_TE",
+                description=description,
+                keywords=keywords,
+                evidence_text=evidence_text,
+                confidence=max(0.55, min(confidence, 0.8)),
+            )
+
+    return None
+
+
+def hard_invalid_relation_reason(
+    *,
+    subject: str,
+    subject_type: str,
+    relation_type: str,
+    object_: str,
+    object_type: str,
+    evidence_text: str,
+) -> str | None:
+    """Return a reason when a relation is a high-confidence wrong link.
+
+    These guards are intentionally narrow. They are not an ontology judge; they
+    only block patterns observed in graph audit that create harmful edges.
+    """
+    evidence = str(evidence_text or "").lower()
+
+    # Hospital/service/marketing sections often list many diseases and services,
+    # causing fake treatment/diagnosis edges such as khoa da liễu -> lão hoá da.
+    if contains_any(evidence, PROMOTIONAL_EVIDENCE_CUES):
+        return "promotional_or_service_evidence"
+
+    if relation_type == "CHAN_DOAN_BANG" and object_type != "PHUONG_PHAP_CHAN_DOAN":
+        return "diagnosis_object_not_diagnostic_method"
+
+    if relation_type == "DIEU_TRI_BANG" and object_type not in {
+        "THUOC_VA_HOAT_CHAT",
+        "CAN_THIEP_Y_TE",
+    }:
+        return "treatment_object_not_treatment_or_drug"
+
+    if relation_type == "PHONG_NGUA_BANG" and object_type in {
+        "BENH_LY",
+        "YEU_TO_BENH_SINH",
+    }:
+        return "prevention_object_is_disease_or_pathogen"
+
+    if relation_type == "CAN_TRANH" and not contains_any(evidence, AVOID_RELATION_CUES):
+        return "avoid_relation_without_avoid_cue"
+
+    if relation_type == "GAY_BIEN_CHUNG" and not contains_any(evidence, COMPLICATION_CUES):
+        return "complication_relation_without_complication_cue"
+
+    return None
 
 
 def clean_entity_name(name: str) -> str:
@@ -254,6 +485,8 @@ class ExtractionValidator:
                     surface_forms=[],
                     description="",
                     evidence_text=relation.evidence_text,
+                    is_anchor_candidate=True,
+                    anchor_reason="relation_endpoint",
                 )
                 entities.append(entity)
                 entity_map[s_key] = entity
@@ -266,6 +499,8 @@ class ExtractionValidator:
                     surface_forms=[],
                     description="",
                     evidence_text=relation.evidence_text,
+                    is_anchor_candidate=True,
+                    anchor_reason="relation_endpoint",
                 )
                 entities.append(entity)
                 entity_map[o_key] = entity
@@ -300,6 +535,12 @@ class ExtractionValidator:
 
             description = clean_short_text(entity.description, max_chars=500)
             evidence_text = clean_short_text(entity.evidence_text, max_chars=800)
+            inferred_anchor, inferred_reason = infer_anchor_candidate(name, entity_type)
+            is_anchor_candidate = bool(entity.is_anchor_candidate or inferred_anchor)
+            anchor_reason = clean_short_text(
+                entity.anchor_reason or inferred_reason,
+                max_chars=160,
+            )
 
             key = (normalize_name(name), entity_type)
 
@@ -312,6 +553,8 @@ class ExtractionValidator:
                     surface_forms=[],
                     description=old.description or description,
                     evidence_text=old.evidence_text or evidence_text,
+                    is_anchor_candidate=old.is_anchor_candidate or is_anchor_candidate,
+                    anchor_reason=old.anchor_reason or anchor_reason,
                 )
                 continue
 
@@ -322,6 +565,8 @@ class ExtractionValidator:
                 surface_forms=[],
                 description=description,
                 evidence_text=evidence_text,
+                is_anchor_candidate=is_anchor_candidate,
+                anchor_reason=anchor_reason,
             )
 
         return list(by_key.values())
@@ -363,6 +608,41 @@ class ExtractionValidator:
                 object_type,
             ):
                 continue
+
+            invalid_reason = hard_invalid_relation_reason(
+                subject=subject,
+                subject_type=subject_type,
+                relation_type=relation_type,
+                object_=object_,
+                object_type=object_type,
+                evidence_text=evidence_text,
+            )
+            if invalid_reason:
+                repaired = repair_relation_if_possible(
+                    subject=subject,
+                    subject_type=subject_type,
+                    relation_type=relation_type,
+                    object_=object_,
+                    object_type=object_type,
+                    evidence_text=evidence_text,
+                    description=clean_short_text(relation.description, max_chars=500),
+                    keywords=clean_relation_keywords(
+                        relation.keywords,
+                        subject=subject,
+                        object_=object_,
+                        limit=8,
+                    ),
+                    confidence=clamp_confidence(relation.confidence),
+                )
+                if repaired is None:
+                    continue
+
+                subject = clean_entity_name(repaired.subject)
+                object_ = clean_entity_name(repaired.object)
+                subject_type = repaired.subject_type
+                object_type = repaired.object_type
+                relation_type = repaired.relation_type
+                relation = repaired
 
             key = (
                 normalize_name(subject),

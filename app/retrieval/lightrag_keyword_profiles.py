@@ -302,30 +302,14 @@ class KeywordProfileGenerator:
         return self._semantic_hints_from_text(" ".join([subject_name, object_name, text]))
 
     def _semantic_hints_from_text(self, text: str) -> list[str]:
-        """Extract lightweight text-derived hints without domain keyword lists.
+        """Do not mine arbitrary n-grams from evidence for fallback keywords.
 
-        This fallback is used only when no LLM profile is available. It mines
-        repeated/long n-grams from the provided evidence text, instead of using
-        hand-written medical categories such as respiratory/dermatology/allergy.
+        Graph audits showed that evidence-derived n-grams can become noisy
+        strings such as long copied clauses or comma-glued medication lists.
+        Keyword quality is primarily handled by the article-level keyword LLM
+        profiler; deterministic fallback should stay conservative.
         """
-        normalized = self._normalize_ascii(text)
-        tokens = re.findall(r"[a-z0-9]+", normalized)
-        counts: dict[str, int] = {}
-        first_pos: dict[str, int] = {}
-        for n in range(4, 1, -1):
-            for i in range(0, max(len(tokens) - n + 1, 0)):
-                phrase = " ".join(tokens[i : i + n])
-                if not self._looks_like_keyword(phrase):
-                    continue
-                counts[phrase] = counts.get(phrase, 0) + 1
-                first_pos.setdefault(phrase, i)
-
-        ranked = sorted(
-            counts,
-            key=lambda item: (counts[item], len(item.split()), len(item), -first_pos[item]),
-            reverse=True,
-        )
-        return ranked[:5]
+        return []
 
     def _humanize_type(self, value: str) -> str:
         return (value or "").lower().replace("_", " ")
@@ -441,10 +425,15 @@ class KeywordProfileGenerator:
         seen: set[str] = set()
         for item in values:
             value = self._clean_text(str(item))
-            if not value or len(value.split()) > 8:
+            if not value or len(value.split()) > 6:
+                continue
+            if "," in value or ";" in value:
                 continue
             key = self._normalize_ascii(value)
             if not key or key in seen or key in schema_norms:
+                continue
+            # Keep relation keys as short retrieval labels, not copied clauses.
+            if len(key) > 80:
                 continue
             seen.add(key)
             result.append(value)
