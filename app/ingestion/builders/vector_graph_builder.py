@@ -7,14 +7,19 @@ from app.infrastructure.vector_database import (
     VectorRepository,
     make_qdrant_point_id,
 )
-from app.ingestion.extraction import ExtractedEntity, ExtractedGraph, ExtractedRelation
+from app.ingestion.extraction.common.extraction_models import (
+    ExtractedEntity,
+    ExtractedGraph,
+    ExtractedRelation,
+)
 from app.ingestion.processing import ChunkDocument
-from app.ingestion.extraction.keyword_profiler import (
+from app.ingestion.extraction.keyword.keyword_profiler import (
     clean_retrieval_keywords,
     deterministic_relation_keywords,
 )
 from app.ingestion.resolution import EntityResolver, ResolvedEntity, make_relation_id
 from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
+from app.ingestion.policies.graph_write_policy import graph_with_selected_entities
 
 
 class VectorGraphBuilder:
@@ -126,12 +131,16 @@ class VectorGraphBuilder:
         self,
         chunk: ChunkDocument,
         extracted_graph: ExtractedGraph,
+        allowed_relation_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> dict:
         """
         Ghi entity/relation vectors sinh ra từ một chunk extraction.
 
         Hàm này không ghi Neo4j. Nếu cần ghi cả graph + vector, hãy gọi
         MedicalGraphBuilder.write_chunk_extraction() trước, rồi gọi hàm này.
+
+        allowed_relation_ids dùng để giữ Qdrant medical_relations đồng bộ với Neo4j:
+        chỉ vector hóa relation đã được Neo4j write policy chấp nhận.
         """
         if not extracted_graph.should_ingest_graph:
             return {
@@ -142,13 +151,19 @@ class VectorGraphBuilder:
                 "skip_reason": extracted_graph.skip_reason,
             }
 
-        resolved_by_key = self._resolve_entities(extracted_graph.entities)
+        # Keep Qdrant medical_entities consistent with Neo4j: only vectorize
+        # entities selected by the same graph-write policy. Relation endpoints
+        # that are missing from the entity list are still resolved below for
+        # relation vector payloads, but loose orphan candidates are not written.
+        selected_graph = graph_with_selected_entities(extracted_graph)
+        resolved_by_key = self._resolve_entities(selected_graph.entities)
 
         entity_points = self._build_entity_points(resolved_by_key.values())
         relation_points = self._build_relation_points(
             chunk=chunk,
-            relations=extracted_graph.relations,
+            relations=selected_graph.relations,
             resolved_by_key=resolved_by_key,
+            allowed_relation_ids=allowed_relation_ids,
         )
 
         if entity_points:
@@ -242,8 +257,10 @@ class VectorGraphBuilder:
         chunk: ChunkDocument,
         relations: list[ExtractedRelation],
         resolved_by_key: dict[tuple[str, str], ResolvedEntity],
+        allowed_relation_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     ) -> list[VectorPoint]:
         relation_payloads: list[RelationVectorPayload] = []
+        allowed_ids = set(allowed_relation_ids) if allowed_relation_ids is not None else None
 
         for relation in relations:
             subject = self._get_or_resolve_endpoint(
@@ -264,6 +281,9 @@ class VectorGraphBuilder:
                 relation_type=relation.relation_type,
                 object_entity_id=object_.entity_id,
             )
+
+            if allowed_ids is not None and relation_id not in allowed_ids:
+                continue
 
             relation_keywords = clean_retrieval_keywords(relation.keywords, limit=8)
             if not relation_keywords:
@@ -297,7 +317,7 @@ class VectorGraphBuilder:
 
         return [
             VectorPoint(
-                point_id=make_qdrant_point_id(f"relation::{payload.relation_id}"),
+                point_id=make_qdrant_point_id(f"relation::{payload.relation_id}::{payload.chunk_id}"),
                 vector=vector,
                 payload=payload.model_dump(),
             )

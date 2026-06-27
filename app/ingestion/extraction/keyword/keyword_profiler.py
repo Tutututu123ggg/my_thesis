@@ -14,8 +14,10 @@ from app.ingestion.extraction.common.extraction_models import ExtractedGraph, Ex
 from app.ingestion.processing import ChunkDocument
 
 
-MAX_KEYWORD_WORDS = 5
-MAX_KEYWORD_CHARS = 80
+MAX_KEYWORD_WORDS = 6
+MAX_KEYWORD_CHARS = 90
+MIN_KEYWORDS_PER_RELATION = 4
+MAX_KEYWORDS_PER_RELATION = 8
 
 
 RELATION_INTENT_EXTRAS: dict[str, list[str]] = {
@@ -71,8 +73,18 @@ class RelationRef:
 
 
 class LLMRelationKeywordUpdate(BaseModel):
-    relation_id: str = Field(description="Relation id from the input pack, e.g. r0001.")
+    relation_id: str = Field(description="Mã relation trong input pack, ví dụ r0001.")
     keywords: list[str] = Field(default_factory=list)
+    # Backward-compatible fields nếu file cache/LLM cũ vẫn trả dạng low/high.
+    low_level_keywords: list[str] = Field(default_factory=list)
+    high_level_keywords: list[str] = Field(default_factory=list)
+
+    def flattened_keywords(self) -> list[str]:
+        return [
+            *self.keywords,
+            *self.low_level_keywords,
+            *self.high_level_keywords,
+        ]
 
 
 class LLMEntityKeywordUpdate(BaseModel):
@@ -121,9 +133,9 @@ def is_bad_retrieval_keyword(value: str) -> bool:
     if any(fragment in norm for fragment in BAD_KEYWORD_FRAGMENTS):
         return True
 
-    # Drop obvious sentence fragments rather than medical terms.
-    sentence_like_tokens = {"va", "hoac", "nhung", "tuy", "dong thoi", "ngoai ra"}
-    if len(norm.split()) >= 4 and any(tok in norm for tok in sentence_like_tokens):
+    # Drop obvious discourse fragments rather than useful retrieval labels.
+    discourse_starters = {"tuy nhien", "dong thoi", "ngoai ra", "vi vay", "do do"}
+    if len(norm.split()) >= 6 and any(norm.startswith(item) for item in discourse_starters):
         return True
 
     return False
@@ -149,47 +161,27 @@ def clean_retrieval_keywords(values: list[str] | tuple[str, ...] | None, *, limi
 
 
 def deterministic_relation_keywords(relation: ExtractedRelation, *, extra_keywords: list[str] | None = None) -> list[str]:
-    """Safe fallback for relation retrieval keywords.
+    """Safe fallback when the LLM keyword profiler is disabled or fails.
 
-    This is intentionally small. The preferred source is the article-level LLM
-    keyword profiler. When that profiler is disabled or returns nothing, keep
-    only endpoint names and a short natural-language relation intent. Avoid
-    mining arbitrary n-grams from evidence because those produced noisy keyword
-    strings in graph audits.
+    LLM mode is preferred. The fallback only keeps minimal endpoint/intent hints
+    so smoke tests and offline runs still have usable retrieval keywords.
     """
 
     intent = get_relation_keyword_intent(relation.relation_type, default="")
-    candidates: list[str] = [
-        relation.subject,
-        relation.object,
-        intent,
-    ]
-
-    # Anchor the intent with the main subject when it remains short. This keeps
-    # fallback keywords retrieval-friendly without a hand-written medical dict.
-    if intent and relation.subject:
-        anchored = f"{intent} {relation.subject}"
-        if len(anchored.split()) <= MAX_KEYWORD_WORDS:
-            candidates.append(anchored)
+    candidates: list[str] = [relation.subject, relation.object]
+    if intent:
+        candidates.append(intent)
 
     candidates.extend(extra_keywords or [])
-    return clean_retrieval_keywords(candidates, limit=8)
+    return clean_retrieval_keywords(candidates, limit=MAX_KEYWORDS_PER_RELATION)
 
 
 class ArticleKeywordProfiler:
-    """Article-level Agent 2 for retrieval keywords only.
+    """Article-level keyword profiler for LightRAG-style retrieval.
 
-    Scope boundary:
-    - does NOT create entities;
-    - does NOT create relations;
-    - does NOT create synonyms;
-    - does NOT change subject/object/relation_type/evidence;
-    - only updates relation.keywords and optionally entity search terms metadata.
-
-    If no model is configured, the profiler still applies deterministic safe
-    relation keywords. If a model is configured, it receives a compact article
-    pack: title/headings/short summary + validated entities/relations, not raw
-    full markdown.
+    It receives validated entities/relations plus title/heading/chunk/evidence
+    context and lets the LLM infer short retrieval labels. The output stays in
+    the existing relation.keywords field to avoid changing graph/schema code.
     """
 
     def __init__(
@@ -223,12 +215,21 @@ class ArticleKeywordProfiler:
                 llm_updates = {}
 
         updated_count = 0
+        fallback_count = 0
         for ref in relation_refs:
             relation = graphs[ref.chunk_index].relations[ref.relation_index]
-            merged = deterministic_relation_keywords(
-                relation,
-                extra_keywords=[*(relation.keywords or []), *llm_updates.get(ref.relation_id, [])],
-            )
+            llm_keywords = llm_updates.get(ref.relation_id, [])
+            if llm_keywords:
+                # LLM keywords are preferred. Do not force the old subject/object/intent
+                # formula on top of them, because that makes keyword profiles too uniform.
+                merged = clean_retrieval_keywords(
+                    [*(relation.keywords or []), *llm_keywords],
+                    limit=MAX_KEYWORDS_PER_RELATION,
+                )
+            else:
+                fallback_count += 1
+                merged = deterministic_relation_keywords(relation, extra_keywords=relation.keywords or [])
+
             graphs[ref.chunk_index].relations[ref.relation_index] = relation.model_copy(update={"keywords": merged})
             updated_count += 1
 
@@ -238,8 +239,9 @@ class ArticleKeywordProfiler:
             "relation_count": len(relation_refs),
             "updated_relation_count": updated_count,
             "llm_update_count": len(llm_updates),
+            "fallback_relation_count": fallback_count,
             "llm_error": llm_error,
-            "policy": "article_level_relation_keyword_metadata_only_no_synonyms",
+            "policy": "lightrag_keyword_profiler_llm_preferred_safe_fallback",
         }
 
     def _relation_refs(self, chunks: list[ChunkDocument], graphs: list[ExtractedGraph]) -> list[RelationRef]:
@@ -291,7 +293,7 @@ class ArticleKeywordProfiler:
         for item in profile.relation_keyword_updates:
             if item.relation_id not in valid_ids:
                 continue
-            keywords = clean_retrieval_keywords(item.keywords, limit=8)
+            keywords = clean_retrieval_keywords(item.flattened_keywords(), limit=MAX_KEYWORDS_PER_RELATION)
             if keywords:
                 updates[item.relation_id] = keywords
         return updates
@@ -337,9 +339,12 @@ class ArticleKeywordProfiler:
             relations.append(
                 {
                     "id": ref.relation_id,
+                    "article_title": title,
                     "chunk_id": ref.chunk_id,
                     "section": chunk.section or "",
                     "subsection": chunk.subsection or "",
+                    "heading_path": chunk.heading_path or [],
+                    "chunk_text_excerpt": str(chunk.text or "")[:1200],
                     "subject": relation.subject,
                     "subject_type": relation.subject_type,
                     "relation_type": relation.relation_type,
@@ -370,11 +375,11 @@ class ArticleKeywordProfiler:
 ARTICLE_KEYWORD_PROFILER_SYSTEM_PROMPT = """
 Bạn là Retrieval Keyword Profiler cho Vietnamese Medical GraphRAG.
 
-Vai trò của bạn CHỈ là enrich metadata keyword phục vụ retrieval.
-Bạn KHÔNG được tạo entity mới, KHÔNG tạo relation mới, KHÔNG tạo synonym,
-KHÔNG đổi subject/object/relation_type/evidence.
+Vai trò của bạn là enrich metadata keyword phục vụ retrieval cho các relation đã được validate.
+Bạn không tạo entity mới, không tạo relation mới, không tạo synonym, không đổi subject/object/relation_type/evidence.
 
 Input gồm title, section_titles, short_summary, entities và validated relations của một bài.
+Mỗi relation có thể có section, heading_path, chunk_text_excerpt và evidence_text để bạn hiểu đúng ngữ cảnh truy hồi.
 
 Output JSON duy nhất:
 {
@@ -386,9 +391,10 @@ Output JSON duy nhất:
 
 Mục tiêu keyword:
 - Keyword là nhãn truy hồi ngắn cho relation, không phải evidence.
+- Hãy tự suy luận keyword như người thiết kế index cho LightRAG: keyword nào giúp query tìm lại đúng relation/evidence thì giữ.
 - Keyword có thể generic vừa đủ nếu giúp retrieval, ví dụ: "da liễu", "nấm da", "bệnh móng", "thuốc kháng nấm".
-- Keyword cũng nên có cụm specific theo subject/object, ví dụ: "điều trị lang ben", "soi tươi KOH", "itraconazole".
-- Mỗi relation nên có 4-8 keywords.
+- Keyword cũng nên có cụm specific theo subject/object/evidence, ví dụ: "điều trị lang ben", "soi tươi KOH", "itraconazole".
+- Mỗi relation nên có 4-8 keywords nếu có đủ ngữ cảnh; 4 keyword sạch tốt hơn 8 keyword nhiễu.
 
 Quy tắc format bắt buộc:
 - Mỗi phần tử trong keywords là MỘT keyword riêng.
@@ -396,7 +402,7 @@ Quy tắc format bắt buộc:
 - Mỗi keyword thường tối đa 5 từ; tên bệnh/thuốc/phương pháp dài có thể tối đa 6 từ.
 - Không copy nguyên câu evidence, không sinh mảnh câu dài.
 - Không dùng schema enum như BENH_LY, CO_BIEU_HIEN, DIEU_TRI_BANG.
-- Không thêm fact y khoa mới xa evidence.
+- Không thêm fact y khoa mới xa evidence/chunk_text_excerpt.
 - Không trả markdown, không giải thích.
 
 Few-shot tốt/xấu:

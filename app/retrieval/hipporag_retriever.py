@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from app.infrastructure.graph_database import GraphRepository
+from app.retrieval.chunk_postprocessing import collapse_fact_window_chunks_to_parents
 from app.retrieval.evidence_expander import EvidenceExpansionConfig, GraphEvidenceExpander
 from app.retrieval.graph_scoring import GraphQueryScorer
 from app.retrieval.query_analyzer import QueryAnalyzer
@@ -218,6 +219,9 @@ class HippoRAGRetriever:
                 analysis=analysis,
             )
             snapshot_chunks("after_evidence_expansion", chunks)
+
+        chunks = collapse_fact_window_chunks_to_parents(chunks, graph_repo=self.graph_repo)
+        snapshot_chunks("after_parent_chunk_collapse", chunks)
 
         if self.config.enable_final_source_diversity:
             chunks = self._apply_final_source_diversity(query=query, keywords=keywords, chunks=chunks)

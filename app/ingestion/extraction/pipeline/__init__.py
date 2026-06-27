@@ -1,11 +1,11 @@
-from app.ingestion.extraction.pipeline.article_extraction_pipeline import (
-    ArticleExtractionPipeline,
-    ArticleExtractionResult,
+from app.ingestion.extraction.pipeline.full_corpus_ingest_pipeline import (
+    FullCorpusIngestConfig,
+    FullCorpusIngestPipeline,
+    run_full_corpus_ingest,
 )
-from app.ingestion.extraction.pipeline.extraction_service import ExtractionService
 
 __all__ = [
-    "ArticleExtractionPipeline",
-    "ArticleExtractionResult",
-    "ExtractionService",
+    "FullCorpusIngestConfig",
+    "FullCorpusIngestPipeline",
+    "run_full_corpus_ingest",
 ]

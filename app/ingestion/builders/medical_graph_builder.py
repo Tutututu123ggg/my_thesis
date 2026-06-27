@@ -5,7 +5,7 @@ from app.infrastructure.graph_database import (
     GraphRepository,
     MedicalRelation,
 )
-from app.ingestion.extraction import (
+from app.ingestion.extraction.common.extraction_models import (
     ExtractedEntity,
     ExtractedGraph,
     ExtractedRelation,
@@ -18,6 +18,11 @@ from app.ingestion.resolution import (
     make_relation_id,
 )
 from app.retrieval.lightrag_keyword_profiles import KeywordProfileGenerator
+from app.ingestion.policies.graph_write_policy import (
+    entities_selected_for_graph_write,
+    entity_key as shared_entity_key,
+    is_keepable_anchor_entity,
+)
 
 
 def _normalize_key_text(value: str) -> str:
@@ -30,72 +35,15 @@ def _normalize_key_text(value: str) -> str:
 
 
 def _entity_key(name: str, entity_type: str) -> tuple[str, str]:
-    return (_normalize_key_text(name), str(entity_type or "").strip())
+    return shared_entity_key(name, entity_type)
 
 
 def _is_keepable_anchor_entity(entity: ExtractedEntity) -> bool:
-    if not getattr(entity, "is_anchor_candidate", False):
-        return False
-
-    if entity.entity_type in {
-        "BENH_LY",
-        "THUOC_VA_HOAT_CHAT",
-        "PHUONG_PHAP_CHAN_DOAN",
-        "YEU_TO_BENH_SINH",
-    }:
-        return True
-
-    if entity.entity_type == "BIEU_HIEN_LAM_SANG" and len(str(entity.name or "").split()) >= 2:
-        return True
-
-    return False
+    return is_keepable_anchor_entity(entity)
 
 
 def _entities_selected_for_write(extracted_graph: ExtractedGraph) -> tuple[list[ExtractedEntity], dict[str, int]]:
-    """Persist relation endpoints + high-value anchor candidates only.
-
-    LLM may extract broad entity candidates to protect relation recall. Neo4j
-    should receive a pruned graph, not every candidate. Relation endpoints are
-    always kept; orphan candidates are kept only when explicitly/inferentially
-    marked as high-value anchors such as diseases, drugs, diagnostic methods,
-    pathogens, or specific clinical manifestations.
-    """
-    endpoint_keys: set[tuple[str, str]] = set()
-    for relation in extracted_graph.relations:
-        endpoint_keys.add(_entity_key(relation.subject, relation.subject_type))
-        endpoint_keys.add(_entity_key(relation.object, relation.object_type))
-
-    selected: list[ExtractedEntity] = []
-    seen: set[tuple[str, str]] = set()
-    endpoint_count = 0
-    anchor_count = 0
-    pruned_count = 0
-
-    for entity in extracted_graph.entities:
-        key = _entity_key(entity.name, entity.entity_type)
-        if not key[0] or key in seen:
-            continue
-
-        is_endpoint = key in endpoint_keys
-        is_anchor = _is_keepable_anchor_entity(entity)
-
-        if is_endpoint or is_anchor:
-            selected.append(entity)
-            seen.add(key)
-            if is_endpoint:
-                endpoint_count += 1
-            elif is_anchor:
-                anchor_count += 1
-        else:
-            pruned_count += 1
-
-    return selected, {
-        "candidate_entity_count": len(extracted_graph.entities),
-        "selected_entity_count": len(selected),
-        "endpoint_entity_count": endpoint_count,
-        "kept_anchor_entity_count": anchor_count,
-        "pruned_orphan_candidate_count": pruned_count,
-    }
+    return entities_selected_for_graph_write(extracted_graph)
 
 
 class MedicalGraphBuilder:
@@ -137,6 +85,7 @@ class MedicalGraphBuilder:
                 "entity_write_count": 0,
                 "mention_write_count": 0,
                 "relation_write_count": 0,
+                "written_relation_ids": [],
                 "skipped_graph_ingest": True,
                 "skip_reason": extracted_graph.skip_reason,
             }
@@ -176,6 +125,7 @@ class MedicalGraphBuilder:
                 mention_write_count += 1
 
         relation_write_count = 0
+        written_relation_ids: list[str] = []
 
         for relation in extracted_graph.relations:
             subject = self._resolve_relation_endpoint(
@@ -242,12 +192,14 @@ class MedicalGraphBuilder:
 
             if ok:
                 relation_write_count += 1
+                written_relation_ids.append(relation_id)
 
         return {
             "chunk_id": chunk.chunk_id,
             "entity_write_count": entity_write_count,
             "mention_write_count": mention_write_count,
             "relation_write_count": relation_write_count,
+            "written_relation_ids": written_relation_ids,
             "skipped_graph_ingest": False,
             "skip_reason": None,
             **prune_stats,

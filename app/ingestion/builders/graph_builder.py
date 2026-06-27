@@ -55,6 +55,24 @@ class GraphBuilder:
 
             self.graph_repo.upsert_chunk(node)
 
+    def link_fact_windows_to_parents(self, chunks: list[ChunkDocument]) -> int:
+        count = 0
+        for chunk in chunks:
+            metadata = dict(chunk.metadata or {})
+            parent_chunk_id = str(metadata.get("parent_chunk_id") or "").strip()
+            if not parent_chunk_id:
+                continue
+            if parent_chunk_id == chunk.chunk_id:
+                continue
+
+            self.graph_repo.link_fact_window_to_parent(
+                child_chunk_id=chunk.chunk_id,
+                parent_chunk_id=parent_chunk_id,
+            )
+            count += 1
+
+        return count
+
     def ingest_article_with_chunks(
         self,
         article: ArticleDocument,
@@ -62,3 +80,4 @@ class GraphBuilder:
     ) -> None:
         self.upsert_article(article)
         self.upsert_chunks(chunks)
+        self.link_fact_windows_to_parents(chunks)

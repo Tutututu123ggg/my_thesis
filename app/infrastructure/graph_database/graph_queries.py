@@ -51,6 +51,11 @@ CREATE_INDEXES = [
     FOR ()-[r:MEDICAL_RELATION]-()
     ON (r.relation_type)
     """,
+    """
+    CREATE INDEX medical_relation_id_index IF NOT EXISTS
+    FOR ()-[r:MEDICAL_RELATION]-()
+    ON (r.relation_id)
+    """,
 ]
 
 # =========================
@@ -227,6 +232,23 @@ SET
     r.chunk_index = $chunk_index,
     r.section = $section,
     r.subsection = $subsection
+"""
+
+
+
+LINK_FACT_WINDOW_TO_PARENT = """
+MATCH (child:Chunk {chunk_id: $child_chunk_id})
+MATCH (parent:Chunk {chunk_id: $parent_chunk_id})
+MERGE (parent)-[h:HAS_FACT_WINDOW]->(child)
+SET
+    h.parent_chunk_id = $parent_chunk_id,
+    h.child_chunk_id = $child_chunk_id,
+    h.updated_in_neo4j_at = datetime()
+MERGE (child)-[d:DERIVED_FROM]->(parent)
+SET
+    d.parent_chunk_id = $parent_chunk_id,
+    d.child_chunk_id = $child_chunk_id,
+    d.updated_in_neo4j_at = datetime()
 """
 
 UPSERT_ENTITY = """
@@ -432,6 +454,13 @@ RETURN
     chunk_count,
     entity_count,
     count(r) AS relation_count
+"""
+
+
+
+COUNT_PARENT_CHILD_EDGES = """
+MATCH (parent:Chunk)-[:HAS_FACT_WINDOW]->(child:Chunk)
+RETURN count(*) AS parent_child_edges
 """
 
 DELETE_ALL_DATA = """

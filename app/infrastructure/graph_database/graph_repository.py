@@ -84,6 +84,25 @@ class GraphRepository:
         with self.client.session() as session:
             session.run(q.UPSERT_CHUNK, params)
 
+    def link_fact_window_to_parent(
+        self,
+        *,
+        child_chunk_id: str,
+        parent_chunk_id: str,
+    ) -> None:
+        if not child_chunk_id or not parent_chunk_id:
+            return
+        if child_chunk_id == parent_chunk_id:
+            return
+
+        params = {
+            "child_chunk_id": child_chunk_id,
+            "parent_chunk_id": parent_chunk_id,
+        }
+
+        with self.client.session() as session:
+            session.run(q.LINK_FACT_WINDOW_TO_PARENT, params)
+
     def upsert_entity(self, entity: EntityNode) -> bool:
         if not is_valid_entity_type(entity.entity_type):
             return False
@@ -266,6 +285,14 @@ class GraphRepository:
             "entity_count": int(record["entity_count"]),
             "relation_count": int(record["relation_count"]),
         }
+
+    def count_parent_child_edges(self) -> int:
+        with self.client.session() as session:
+            record = session.run(q.COUNT_PARENT_CHILD_EDGES).single()
+
+        if not record:
+            return 0
+        return int(record["parent_child_edges"] or 0)
 
     # =====================
     # Entity lookup / resolution

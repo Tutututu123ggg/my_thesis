@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from app.infrastructure.graph_database import EntityNode, GraphRepository
-from app.ingestion.extraction import ExtractedEntity
+from app.ingestion.extraction.common.extraction_models import ExtractedEntity
 from app.ingestion.resolution.normalizer import (
     clean_surface_text,
     make_entity_id,

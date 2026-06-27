@@ -1,138 +1,156 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
 from app.domain.medical_schema import (
-    ENTITY_TYPES,
     RELATION_TYPES,
-    build_entity_type_descriptions,
     build_relation_prompt_guidance_text,
     build_relation_rules_text,
     build_relation_type_descriptions,
 )
 
 
-RELATION_KEYWORD_RULES = """
-relation.keywords là metadata phụ, KHÔNG phải nhiệm vụ chính của extractor:
-- Extractor có thể để relation.keywords = [] nếu không chắc.
-- Nếu sinh, chỉ dùng cụm ngắn tối đa 5 từ, ví dụ: "thuốc chống nấm", "triệu chứng", "nguy cơ viêm phổi".
+RELATION_RECALL_GUIDE = """
+Mục tiêu relation:
+- Tạo các quan hệ y khoa/sức khỏe có evidence rõ ràng, hữu ích cho truy hồi.
+- Dùng input entity list làm endpoint.
+- Dùng title/heading của các đề mục cha để khôi phục subject ẩn của claim trong list/bullet.
+- Nếu fact rõ nhưng relation_type chưa hoàn hảo, chọn relation_type gần nhất trong schema và giữ edge.
+- Khi nhiều endpoint có cùng subject, cùng relation_type và cùng evidence/list/heading, ưu tiên relation_groups dạng 1-n.
+- Khi nhiều subject cùng liên quan tới một object theo cùng relation_type, ưu tiên relation_groups dạng n-1.
 """.strip()
 
 
-RELATION_COVERAGE_RULES = """
-Luồng trích xuất:
+COVERAGE_CHECKLIST = """
+Coverage checklist bắt buộc sau khi draft relation để đảm bảo đã lấy toàn bộ các quan hệ phù hợp với schema giữa các entity đã được xác định trong đoạn văn bản:
 
-1. Phân loại nhanh chunk; nếu không có tri thức y khoa thuộc schema thì bỏ qua.
-2. Đọc evidence trước và tạo relation giữa các thực thể có quan hệ có thể được hiểu từ văn bản.
-3. Dùng title/heading để hiểu ngữ cảnh, nhưng vẫn cần chú trọng quan hệ cụ thể trong evidence.
-4. Hãy cố trích xuất đầy đủ và trung thực. Ví dụ: Nếu thuốc được ghi là cải thiện một triệu chứng cụ thể, hãy nối với entity triệu chứng chứ không phải bệnh. Nếu cũng có evidence cho thấy thuốc được dùng cho bệnh, có thể tạo THÊM relation với bệnh.
-7. Khi evidence có quan hệ trực tiếp giữa hai thực thể mà không hợp relation_type nào trong schema, dùng LIEN_QUAN_TRUC_TIEP_DEN để biểu thị mối liên quan "khác".
-8. Relation có thể là 1-1 hoặc 1-vs-many:
-   - A --x--> (B, C, D), hoặc
-   - (A, B, C) --x--> D.
-10. Nếu khó chọn relation_type chính xác, chọn relation_type gần nhất trong schema thay vì bỏ relation có ý nghĩa.
-11. Entity list phải trích xuất tất cả thực thể y khoa rõ ràng thuộc schema trong chunk, không chỉ subject/object.
-12. Sau khi có triples, kiểm tra lại để entity list có đủ mọi subject/object của relation.
-13. Với mỗi câu/bullet có tri thức y khoa, cố gắng tạo ít nhất một relation nếu có thể.
-14. Bullet phòng ngừa: object thường là hành động/biện pháp, không phải tác nhân bị ngăn. Ví dụ "lau khô đầu để hạn chế nấm" -> object là "lau khô đầu".
-15. Bullet điều trị: object thường là thuốc, hoạt chất, chăm sóc hoặc can thiệp.
-16. Câu nguyên nhân/yếu tố: object là tác nhân, môi trường, cơ địa, bệnh nền hoặc yếu tố nguy cơ.
-17. Câu triệu chứng: object là biểu hiện lâm sàng.
-18. Cuối cùng mới gắn relation.keywords dựa trên triple và evidence_text đã chọn.
+1. Với mỗi entity thuộc THUOC_VA_HOAT_CHAT, CAN_THIEP_Y_TE, PHUONG_PHAP_CHAN_DOAN, YEU_TO_NGOAI_SINH:
+   nếu text/heading nói rõ nó dùng để điều trị, giảm triệu chứng, phòng ngừa, tránh nguy cơ hoặc chẩn đoán,
+   phải tạo ít nhất một relation nối nó với bệnh/triệu chứng tương ứng.
 
-Ví dụ:
+2. Với mỗi bullet/câu có tri thức y khoa thuộc schema và có evidence:
+cố tạo ít nhất một relation nếu có thể xác định hai endpoint trong entity list hoặc trong title/heading.
 
-- "lác đồng tiền khiến người bệnh ngứa dữ dội"
-  => lác đồng tiền CO_BIEU_HIEN ngứa dữ dội
+3. Nếu biện pháp/thuốc cải thiện triệu chứng cụ thể:
+   tạo relation "triệu chứng --DIEU_TRI_BANG--> biện pháp/thuốc".
+   Nếu heading/title cũng nói đang điều trị bệnh chính, tạo thêm "bệnh --DIEU_TRI_BANG--> biện pháp/thuốc".
 
-- "thuốc kháng Histamine cải thiện ngứa dữ dội ở người bệnh hắc lào"
-  => ngứa dữ dội DIEU_TRI_BANG thuốc kháng Histamine
-  => hắc lào DIEU_TRI_BANG thuốc kháng Histamine
+4. Nếu có quan hệ trực tiếp giữa hai entity không phải BENH_LY và không có relation_type cụ thể hơn:
+   dùng LIEN_QUAN_TRUC_TIEP_DEN để giữ cạnh chéo.
 
-- "Ketoconazole là thuốc trị lác đồng tiền"
-  => lác đồng tiền DIEU_TRI_BANG Ketoconazole
+5. evidence chỉ nói một thuốc/biện pháp được dùng sai, dùng nhầm, không hiệu quả hoặc làm nặng hơn, không tạo DIEU_TRI_BANG,
+   dùng CAN_TRANH nếu text có ý khuyến cáo không dùng, không làm, hạn chế hoặc tránh.
 
-- "Việc lau khô hoặc sấy khô đầu sau khi gội là rất quan trọng để hạn chế sự ẩm ướt, tạo điều kiện cho nấm phát triển"
-  => nấm da đầu PHONG_NGUA_BANG lau khô hoặc sấy khô đầu sau khi gội
-  Không tạo: nấm da đầu PHONG_NGUA_BANG nấm
+6. Không bỏ relation chỉ vì subject không lặp lại trong câu.
+   Được dùng bệnh/tình trạng trong title/heading làm subject nếu bullet/list đang nằm dưới heading điều trị/phòng ngừa/xử lý/cần tránh của bệnh đó.
 
-- "Móng tay có vết tổn thương nhỏ hoặc đang mắc bệnh về da như vẩy nến. Người bị tiểu đường, hội chứng Down có nguy cơ cao hơn"
-  => nấm móng tay LIEN_QUAN_YEU_TO vẩy nến
-  => nấm móng tay LIEN_QUAN_YEU_TO tiểu đường
-  => nấm móng tay LIEN_QUAN_YEU_TO hội chứng Down
+7. Sau khi sinh relation, kiểm tra lại các entity dạng thuốc/can thiệp/chẩn đoán/chăm sóc/phòng ngừa.
+   Nếu còn entity quan trọng không xuất hiện ở bất kỳ endpoint nào mà text nêu vai trò rõ, hãy thêm relation phù hợp.
+
+8. Với mọi cấp của list/bullet:
+   - Dùng title/heading/bullet cha để xác định subject và intent nếu subject bị ẩn.
+   - Nếu bullet cha nêu category và bullet/câu có các item cụ thể, hãy tạo relation cho cả category nếu hữu ích và relation riêng cho từng item cụ thể quan trọng.
+   - Không dừng lại sau item đầu hoặc sau category-level relation.
 """.strip()
 
 
-CHUNK_CLASSIFICATION_RULES = """
-Trước khi extract, phải phân loại chunk:
-- Nếu chunk có tri thức y khoa thuộc schema, đặt is_medical_knowledge_chunk=true, không thì =false.
-- Khi is_medical_knowledge_chunk=false: skip_reason phải là một chuỗi ngắn,
-  entities=[], relations=[].
-
-Ví dụ giữ phần y khoa:
-Text: "Người bệnh viêm da cơ địa nên đến bệnh viện X để được khám."
-Output: có thể extract entity "viêm da cơ địa" nếu cần, nhưng không extract "bệnh viện X".
+RELATION_TYPE_HINTS = """
+Gợi ý chọn relation_type gần nhất:
+- điều trị, giảm triệu chứng, phục hồi, chăm sóc -> DIEU_TRI_BANG
+- phòng ngừa, giảm nguy cơ, tránh tái phát/lây lan -> PHONG_NGUA_BANG
+- nguyên nhân, tác nhân, kích hoạt, độc tố, dị nguyên, kích ứng, làm nặng -> LIEN_QUAN_YEU_TO
+- triệu chứng/dấu hiệu -> CO_BIEU_HIEN
+- xét nghiệm/thăm khám/chẩn đoán -> CHAN_DOAN_BANG
+- cảnh báo tránh rõ ràng -> CAN_TRANH
+- quan hệ có evidence nhưng không khớp loại nào hơn -> LIEN_QUAN_TRUC_TIEP_DEN
 """.strip()
 
 
-SYNONYM_RULES = """
-Quy tắc DONG_NGHIA_VOI:
-- Phải tạo entity riêng và relation DONG_NGHIA_VOI khi chunk có tín hiệu ngôn ngữ rõ ràng như:
-  "còn gọi là", "còn được gọi là", "hay gọi là", "còn có tên là", "tên khác là",
-  "tiếng Anh là", "viết tắt là", hoặc ngoặc giải thích tên gọi.
-
-Ví dụ đúng:
-Text: "Tiểu đường còn gọi là đái tháo đường."
-Entities:
-- tiểu đường (BENH_LY)
-- đái tháo đường (BENH_LY)
-Relation:
-- tiểu đường --DONG_NGHIA_VOI--> đái tháo đường
-
-Ví dụ sai:
-Text: "Vảy nến thể giọt là một thể của bệnh vảy nến."
-Relation đúng:
-- vảy nến thể giọt --LA_DANG_CUA--> bệnh vảy nến
-Không tạo DONG_NGHIA_VOI.
-
+RELATION_GROUP_GUIDE = """
+Cách dùng relation_groups:
+- Dùng relation_groups cho quan hệ 1-n hoặc n-1 khi các cạnh có cùng relation_type và cùng evidence/list/heading.
+- 1-n: một subject nối tới nhiều object. Ví dụ một bệnh có nhiều biện pháp điều trị/phòng ngừa trong cùng bullet/list.
+- n-1: nhiều subject nối tới một object. Ví dụ nhiều triệu chứng cùng được cải thiện bởi một thuốc/biện pháp.
+- Với mỗi group, một phía có thể là danh sách nhiều endpoint; phía còn lại nên giữ một endpoint để tránh many-vs-many mơ hồ.
+- evidence_text của group có thể là câu/list/heading ngắn hỗ trợ toàn bộ group.
+- Dùng relations[] cho fact 1-1 riêng lẻ; dùng relation_groups[] cho list rõ ràng để không bỏ sót item cuối và giảm output token.
+- Với nested list, relation_groups nên mở rộng các item cụ thể ở mọi cấp list khi chúng đã có trong entity list và cùng chia sẻ subject hoặc relation_type hoặc evidence hoặc heading.
 """.strip()
 
 
-NEGATIVE_EVIDENCE_RULES = """
-Không tạo relation từ evidence chỉ là câu hỏi/heading FAQ.
+RELATION_FEW_SHOTS = """
+Ví dụ 1 — chăm sóc tại nhà, 1-n
+Đề mục: "Cách trị viêm da dị ứng tại nhà"
+Text: "Chườm lạnh hoặc tắm nước mát giúp làm dịu cơn ngứa, giảm tình trạng mề đay và nổi đỏ trên da."
+Entity list:
+- viêm da dị ứng [BENH_LY]
+- chườm lạnh [CAN_THIEP_Y_TE]
+- tắm nước mát [CAN_THIEP_Y_TE]
+- ngứa [BIEU_HIEN_LAM_SANG]
+- mề đay [BIEU_HIEN_LAM_SANG]
+- nổi đỏ trên da [BIEU_HIEN_LAM_SANG]
+Relation group nên có:
+- subjects: [viêm da dị ứng [BENH_LY]]
+  relation_type: DIEU_TRI_BANG
+  objects: [chườm lạnh [CAN_THIEP_Y_TE], tắm nước mát [CAN_THIEP_Y_TE]]
+  evidence_text: "Chườm lạnh hoặc tắm nước mát giúp làm dịu cơn ngứa, giảm tình trạng mề đay và nổi đỏ trên da."
+Relation 1-1 có thể thêm nếu evidence rõ:
+- ngứa [BIEU_HIEN_LAM_SANG] --DIEU_TRI_BANG--> chườm lạnh [CAN_THIEP_Y_TE]
+
+Ví dụ 2 — nguyên liệu/chăm sóc da, 1-n theo intent khác nhau
+Đề mục: "Cách trị viêm da dị ứng tại nhà"
+Text: "Nha đam có hiệu quả dưỡng ẩm, ức chế vi khuẩn, sát trùng da và giúp ngăn ngừa bội nhiễm khi bị dị ứng."
+Entity list:
+- viêm da dị ứng [BENH_LY]
+- nha đam [YEU_TO_NGOAI_SINH]
+- bội nhiễm [BENH_LY]
+Relation nên có:
+- viêm da dị ứng [BENH_LY] --DIEU_TRI_BANG--> nha đam [YEU_TO_NGOAI_SINH]
+- viêm da dị ứng [BENH_LY] --PHONG_NGUA_BANG--> nha đam [YEU_TO_NGOAI_SINH]
+
+Ví dụ 3 — phòng ngừa theo list, 1-n
+Đề mục: "Gợi ý các biện pháp tránh viêm da tiếp xúc do kiến ba khoang"
+Text: "Dùng lưới chống côn trùng, ngủ trong mùng và kiểm tra chăn gối, quần áo trước khi sử dụng."
+Entity list:
+- viêm da tiếp xúc do kiến ba khoang [BENH_LY]
+- lưới chống côn trùng [CAN_THIEP_Y_TE]
+- ngủ trong mùng [CAN_THIEP_Y_TE]
+- kiểm tra chăn gối, quần áo [CAN_THIEP_Y_TE]
+Relation group nên có:
+- subjects: [viêm da tiếp xúc do kiến ba khoang [BENH_LY]]
+  relation_type: PHONG_NGUA_BANG
+  objects: [lưới chống côn trùng [CAN_THIEP_Y_TE], ngủ trong mùng [CAN_THIEP_Y_TE], kiểm tra chăn gối, quần áo [CAN_THIEP_Y_TE]]
+  evidence_text: "Dùng lưới chống côn trùng, ngủ trong mùng và kiểm tra chăn gối, quần áo trước khi sử dụng."
+
+
+Ví dụ 4 — nhiều triệu chứng cùng được làm dịu, n-1
+Text: "Chườm lạnh giúp giảm ngứa, mề đay và nổi đỏ trên da."
+Entity list:
+- ngứa [BIEU_HIEN_LAM_SANG]
+- mề đay [BIEU_HIEN_LAM_SANG]
+- nổi đỏ trên da [BIEU_HIEN_LAM_SANG]
+- chườm lạnh [CAN_THIEP_Y_TE]
+Relation group nên có:
+- subjects: [ngứa [BIEU_HIEN_LAM_SANG], mề đay [BIEU_HIEN_LAM_SANG], nổi đỏ trên da [BIEU_HIEN_LAM_SANG]]
+  relation_type: DIEU_TRI_BANG
+  objects: [chườm lạnh [CAN_THIEP_Y_TE]]
+  evidence_text: "Chườm lạnh giúp giảm ngứa, mề đay và nổi đỏ trên da."
 """.strip()
 
 
-def build_system_prompt(mode: str = "strict_text") -> str:
+def build_relation_system_prompt(mode: str = "strict_text") -> str:
     if mode != "strict_text":
-        raise ValueError(
-            "Only strict_text mode is supported. "
-            "LLM canonicalization is disabled; use DONG_NGHIA_VOI edges instead."
-        )
-
-    merge_policy = """
-Entity naming policy:
-- name phải ưu tiên đúng cách gọi xuất hiện trong chunk.
-- Nếu text nêu rõ hai tên khác nhau là đồng nghĩa, phải tạo entity riêng cho từng tên và tạo relation DONG_NGHIA_VOI.
-""".strip()
+        raise ValueError("Only strict_text mode is supported.")
 
     return f"""
-Bạn là bộ trích xuất tri thức y khoa tiếng Việt cho Medical GraphRAG.
+Bạn là bộ trích xuất relation y khoa tiếng Việt cho Medical GraphRAG.
 
 Nhiệm vụ:
-- Trước hết phân loại nhanh văn bản bằng is_medical_knowledge_chunk / skip_reason.
-- Trích xuất tất cả entity y khoa rõ ràng thuộc schema, có evidence trong chunk/context.
-- Đánh dấu entity anchor tiềm năng bằng is_anchor_candidate/anchor_reason để graph có thể giữ node quan trọng dù chưa nối được relation trong chunk hiện tại.
-- Trích xuất relation/relation_group y khoa theo fact trong evidence, ưu tiên recall relation.
-- relation.keywords có thể để [].
-- Chỉ dùng schema được cho.
-- Mỗi relation phải có evidence_text (evidence có thể là tổng hợp các phần rải rác ở nhiều câu).
-- Không tạo relation cho phần quảng bá/hành chính.
-- Nếu chunk không có tri thức y khoa thuộc schema, trả về entities=[] và relations=[].
-
-{CHUNK_CLASSIFICATION_RULES}
-
-ENTITY TYPES được phép:
-{", ".join(sorted(ENTITY_TYPES))}
-
-Định nghĩa Entity Types:
-{build_entity_type_descriptions()}
+- Đọc title/heading/chunk cùng input entity list.
+- Tạo relation y khoa hoặc sức khỏe có evidence rõ ràng.
+- Ưu tiên endpoint đúng và evidence đúng; relation_type chọn gần nhất theo schema.
+- Mỗi relation cần có evidence_text ngắn (có thể lấy ở nhiều câu) để kiểm chứng.
 
 RELATION TYPES được phép:
 {", ".join(sorted(RELATION_TYPES))}
@@ -140,72 +158,63 @@ RELATION TYPES được phép:
 Định nghĩa Relation Types:
 {build_relation_type_descriptions()}
 
-Gợi ý subject/object theo schema, dùng để chọn hướng relation nhưng KHÔNG ép cứng như ontology:
+Gợi ý subject/object theo schema:
 {build_relation_rules_text()}
 
-Không trích xuất:
-- các label/generic schema như: bệnh lý, biểu hiện lâm sàng, triệu chứng, nguyên nhân, biến chứng, điều trị, phòng ngừa, chẩn đoán
-- các quan hệ quá mơ hồ, không có evidence y khoa trực tiếp
-
-Quy tắc entity:
-- name là tên thực thể ngắn gọn, đúng như xuất hiện trong chunk.
-- Mỗi entity chỉ đại diện cho một tên gọi cụ thể.
-- description là mô tả ngắn 1 câu dựa trên chunk; để "" nếu chunk không đủ thông tin.
-- evidence_text là đoạn bằng chứng ngắn tách ghép từ chunk.
-- Entity list nên bắt rộng: cái gì là khái niệm y khoa rõ ràng thuộc schema thì trích xuất, kể cả khi chưa nối được relation.
-- Sau khi tạo relation, phải đảm bảo mọi subject/object đều có trong entity list.
-- Không tự loại entity chỉ vì nghĩ là kém quan trọng; validator/aggregator sẽ xử lý entity rác hoặc entity không dùng được.
-- Với mỗi entity, đặt is_anchor_candidate=true nếu entity có thể hữu ích độc lập hoặc liên quan nhiều bệnh: bệnh lý, thuốc/hoạt chất, phương pháp chẩn đoán, tác nhân bệnh sinh, yếu tố nguy cơ quan trọng, triệu chứng/dấu hiệu đặc hiệu.
-- Đặt is_anchor_candidate=false cho entity hành chính/quảng bá/đối tượng quá chung: người bệnh, bệnh nhân, trẻ em, phụ huynh, bác sĩ, bệnh viện, khoa da liễu, khách hàng, các thành viên trong gia đình.
-- anchor_reason là lý do ngắn, ví dụ "disease_anchor", "drug_anchor", "diagnostic_method_anchor", "pathogen_anchor"; để "" nếu is_anchor_candidate=false.
-
-{merge_policy}
-
-{SYNONYM_RULES}
-
-Quy tắc relation:
-- subject/object phải là entity y khoa.
-- relation_type phải nằm trong schema.
-- Relation nên đi theo subject/object gợi ý của schema, nhưng không bỏ fact rõ chỉ vì endpoint hơi lệch type.
-- evidence_text phải hỗ trợ relation; có thể dùng heading path để khôi phục mối quan hệ ngầm của list/bullet.
-- confidence từ 0.0 đến 1.0.
-- Ưu tiên độ phủ relation tốt theo fact trong evidence, không biến bệnh chính thành trung tâm bắt buộc của mọi cạnh. Schema là guardrail mềm, evidence là ưu tiên chính.
-- Hãy scan theo checklist mềm: biểu hiện, yếu tố/nguyên nhân, chẩn đoán, điều trị, phòng ngừa, cần tránh, biến chứng, chẩn đoán phân biệt và quan hệ trực tiếp khác giữa các entity.
-
-{RELATION_COVERAGE_RULES}
-
-Quy tắc riêng theo relation type lấy từ schema, render theo style prompt cũ:
+Hướng dẫn chi tiết theo schema:
 {build_relation_prompt_guidance_text()}
 
-{RELATION_KEYWORD_RULES}
+{RELATION_RECALL_GUIDE}
 
-{NEGATIVE_EVIDENCE_RULES}
+{COVERAGE_CHECKLIST}
+
+{RELATION_TYPE_HINTS}
+
+{RELATION_GROUP_GUIDE}
+
+Few-shot:
+{RELATION_FEW_SHOTS}
+
+Output theo schema LLMRelationExtractionResult, gồm relations[] cho quan hệ 1-1 và relation_groups[] cho quan hệ 1-n/n-1.
 """.strip()
 
 
-SYSTEM_PROMPT = build_system_prompt("strict_text")
+def _compact_json(data: Any) -> str:
+    return json.dumps(data or [], ensure_ascii=False, indent=2)
+
+
+def build_relation_user_prompt(
+    markdown_text: str,
+    entities: list[dict[str, Any]] | None = None,
+    explicit_synonym_pairs: list[dict[str, Any]] | None = None,
+) -> str:
+    return f"""
+Nội dung markdown cần tạo relation:
+{markdown_text}
+
+Input entity list:
+```json
+{_compact_json(entities)}
+```
+
+Explicit synonym pairs nếu có:
+```json
+{_compact_json(explicit_synonym_pairs)}
+```
+""".strip()
+
+
+# Backward-compatible aliases for older imports.
+def build_system_prompt(mode: str = "strict_text") -> str:
+    return build_relation_system_prompt(mode)
 
 
 def build_user_prompt(
-    article_title: str,
-    section: str | None,
-    subsection: str | None,
-    chunk_text: str,
-    heading_context: str | None = None,
+    markdown_text: str,
+    entities: list[dict[str, Any]] | None = None,
+    explicit_synonym_pairs: list[dict[str, Any]] | None = None,
 ) -> str:
-    section_text = section or ""
-    subsection_text = subsection or ""
-    heading_context_text = heading_context or ""
+    return build_relation_user_prompt(markdown_text, entities, explicit_synonym_pairs)
 
-    return f"""
-Bài viết: {article_title}
-Mục hiện tại: {section_text}
-Tiểu mục hiện tại: {subsection_text}
-Đường dẫn mục tại đầu chunk: {heading_context_text}
 
-Lưu ý:
-- Đường dẫn mục là ngữ cảnh thật từ cấu trúc bài viết, dùng để xác định subject ngầm cho đoạn đầu chunk và các bullet/list liên quan.
-- Chunk bên dưới là nội dung gốc
-Chunk:
-{chunk_text}
-""".strip()
+SYSTEM_PROMPT = build_relation_system_prompt("strict_text")

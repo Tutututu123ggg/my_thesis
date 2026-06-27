@@ -1,24 +1,41 @@
-from pydantic import BaseModel, Field
+from __future__ import annotations
+
+from pydantic import BaseModel, Field, model_validator
 
 from app.domain.medical_schema import should_flip_relation_direction
 
 
 class LLMExtractedEntity(BaseModel):
     """
-    Entity schema exposed to LLM.
+    Entity schema exposed to the entity-extraction LLM only.
 
-    Important:
-    - Keep this schema minimal.
-    - Do not expose internal bookkeeping fields here.
-    - Different names that are explicitly synonyms must be represented by
-      DONG_NGHIA_VOI relations, not bundled inside one entity.
+    Scope:
+    - Extract entities and local mention variants.
+    - Do not create relations.
+    - Do not create retrieval keywords.
+    - Do not infer synonyms from outside medical knowledge.
     """
 
     name: str = Field(
-        description="Tên thực thể y khoa ngắn gọn, đúng như xuất hiện trong chunk."
+        description="Tên entity y khoa ngắn gọn, tự nhiên nhất trong chunk/title/heading."
     )
     entity_type: str = Field(
         description="Một trong các EntityType đã cho."
+    )
+    mentions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Các surface forms/biến thể cách viết xuất hiện trực tiếp trong chunk/title/heading "
+            "cho cùng entity này. Chỉ lấy biến thể có trong text."
+        ),
+    )
+    explicit_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Tên gọi khác/viết tắt được text nêu rõ là tương đương với entity này "
+            "qua tín hiệu như 'còn gọi là', 'hay còn gọi là', 'viết tắt là'. "
+            "Không suy từ kiến thức ngoài."
+        ),
     )
     description: str = Field(
         default="",
@@ -41,6 +58,115 @@ class LLMExtractedEntity(BaseModel):
     )
 
 
+class LLMExplicitSynonymPair(BaseModel):
+    """
+    Explicit local synonym/alias pair detected by LLM #1.
+
+    This is still entity-level output, not a relation-extraction task:
+    the entity stage may only report equivalence that is directly stated
+    inside the current title/heading/chunk.
+    """
+
+    name_a: str = Field(description="Tên entity/mention thứ nhất, đúng như trong text.")
+    name_b: str = Field(description="Tên entity/mention thứ hai, đúng như trong text.")
+    entity_type: str = Field(
+        description=(
+            "Entity type chung của cả hai tên. Chỉ dùng một type vì synonym/alias "
+            "phải là hai tên của cùng một loại entity."
+        )
+    )
+    evidence_text: str = Field(
+        description=(
+            "Evidence ngắn thể hiện rõ hai tên là tương đương/tên gọi khác/viết tắt. "
+            "Ví dụ chứa 'còn gọi là', 'hay còn gọi là', 'viết tắt là', 'tên khoa học là'."
+        )
+    )
+    confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_previous_type_fields(cls, data):
+        """Allow old cached/manual payloads that used type_a/type_b during transition."""
+
+        if not isinstance(data, dict):
+            return data
+
+        if data.get("entity_type"):
+            return data
+
+        type_a = data.get("type_a")
+        type_b = data.get("type_b")
+        if type_a and type_b and type_a != type_b:
+            # Entity-level synonym pairs should not cross entity types.
+            # Prefer type_a only as a transition fallback; validator/prompt will
+            # prevent new payloads from using this shape.
+            data["entity_type"] = type_a
+        elif type_a or type_b:
+            data["entity_type"] = type_a or type_b
+
+        return data
+
+
+class LLMEntityExtractionResult(BaseModel):
+    """Output of LLM #1: entity extraction + local explicit synonym detection only."""
+
+    is_noise_chunk: bool = Field(
+        default=False,
+        description=(
+            "True chỉ khi chunk gần như toàn quảng bá/hành chính/hotline/đặt lịch/"
+            "navigation/bài liên quan/metadata, không có nội dung y khoa để extract."
+        ),
+    )
+    skip_reason: str | None = Field(
+        default=None,
+        description="Lý do skip ngắn nếu is_noise_chunk=true.",
+    )
+    entities: list[LLMExtractedEntity] = Field(default_factory=list)
+    explicit_synonym_pairs: list[LLMExplicitSynonymPair] = Field(default_factory=list)
+
+    def to_internal_entities(self) -> list["ExtractedEntity"]:
+        if self.is_noise_chunk:
+            return []
+
+        return [
+            ExtractedEntity(
+                name=entity.name,
+                entity_type=entity.entity_type,
+                aliases=list(entity.explicit_aliases or []),
+                surface_forms=list(entity.mentions or []),
+                description=entity.description,
+                evidence_text=entity.evidence_text,
+                is_anchor_candidate=entity.is_anchor_candidate,
+                anchor_reason=entity.anchor_reason,
+            )
+            for entity in self.entities
+        ]
+
+    def to_synonym_relations(self) -> list["ExtractedRelation"]:
+        if self.is_noise_chunk:
+            return []
+
+        relations: list[ExtractedRelation] = []
+        for pair in self.explicit_synonym_pairs or []:
+            if not pair.name_a or not pair.name_b:
+                continue
+            relations.append(
+                ExtractedRelation(
+                    subject=pair.name_a,
+                    subject_type=pair.entity_type,
+                    relation_type="DONG_NGHIA_VOI",
+                    object=pair.name_b,
+                    object_type=pair.entity_type,
+                    description="Tên gọi/viết tắt đồng nghĩa được nêu trực tiếp trong text.",
+                    keywords=[],
+                    evidence_text=pair.evidence_text,
+                    confidence=pair.confidence,
+                )
+            )
+        return relations
+
+
+
 class LLMExtractedRelation(BaseModel):
     """
     Binary relation schema exposed to LLM.
@@ -59,7 +185,7 @@ class LLMExtractedRelation(BaseModel):
     )
     keywords: list[str] = Field(
         default_factory=list,
-        description="Metadata phụ; có thể để [] vì ArticleKeywordProfiler sẽ sinh keyword sạch sau validation.",
+        description="Để [] trong extraction; keywords được sinh bởi ArticleKeywordProfiler sau validation.",
     )
     evidence_text: str = Field(
         description="Đoạn bằng chứng ngắn từ chunk chứng minh relation."
@@ -100,12 +226,109 @@ class LLMExtractedRelationGroup(BaseModel):
     )
     keywords: list[str] = Field(
         default_factory=list,
-        description="Metadata phụ; có thể để [] vì ArticleKeywordProfiler sẽ sinh keyword sạch sau validation.",
+        description="Để [] trong extraction; keywords được sinh bởi ArticleKeywordProfiler sau validation.",
     )
     evidence_text: str = Field(
         description="Đoạn bằng chứng ngắn từ chunk chứng minh relation group."
     )
     confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class LLMRelationCandidate(BaseModel):
+    """Output relation of LLM #2. No keyword field on purpose."""
+
+    subject: str = Field(description="Tên subject entity, ưu tiên dùng name từ entity list đầu vào.")
+    subject_type: str = Field(description="Entity type của subject.")
+    relation_type: str = Field(description="Một trong các RelationType đã cho.")
+    object: str = Field(description="Tên object entity, ưu tiên dùng name từ entity list đầu vào.")
+    object_type: str = Field(description="Entity type của object.")
+    description: str = Field(
+        default="",
+        description="Mô tả ngắn về relation dựa trên chunk. Để rỗng nếu không cần.",
+    )
+    evidence_text: str = Field(description="Đoạn evidence ngắn từ chunk/heading hỗ trợ relation.")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class LLMRelationGroupCandidate(BaseModel):
+    """Grouped 1-vs-many or many-vs-1 relation of LLM #2. No keyword field."""
+
+    subjects: list[LLMRelationEndpoint] = Field(
+        description="Một hoặc nhiều subject endpoints. Nếu nhiều subject thì objects chỉ nên có đúng 1 item."
+    )
+    relation_type: str = Field(description="Một trong các RelationType đã cho.")
+    objects: list[LLMRelationEndpoint] = Field(
+        description="Một hoặc nhiều object endpoints. Nếu nhiều object thì subjects chỉ nên có đúng 1 item."
+    )
+    description: str = Field(
+        default="",
+        description="Mô tả ngắn về relation group dựa trên chunk. Để rỗng nếu không cần.",
+    )
+    evidence_text: str = Field(description="Đoạn evidence ngắn từ chunk/heading hỗ trợ relation group.")
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
+
+
+class LLMRelationExtractionResult(BaseModel):
+    """Output of LLM #2: relation extraction only."""
+
+    relations: list[LLMRelationCandidate] = Field(
+        default_factory=list,
+        description="Binary relations. Use for single subject-object facts.",
+    )
+    relation_groups: list[LLMRelationGroupCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Grouped 1-vs-many or many-vs-1 relations. Do not use many-vs-many. "
+            "The pipeline expands valid groups into binary triples."
+        ),
+    )
+
+    def to_internal_relations(self) -> list["ExtractedRelation"]:
+        internal: list[ExtractedRelation] = []
+
+        for relation in self.relations or []:
+            internal.append(
+                _normalize_relation_direction(
+                    ExtractedRelation(
+                        subject=relation.subject,
+                        subject_type=relation.subject_type,
+                        relation_type=relation.relation_type,
+                        object=relation.object,
+                        object_type=relation.object_type,
+                        description=relation.description,
+                        keywords=[],
+                        evidence_text=relation.evidence_text,
+                        confidence=relation.confidence,
+                    )
+                )
+            )
+
+        for group in self.relation_groups or []:
+            subjects = list(group.subjects or [])
+            objects = list(group.objects or [])
+            if not subjects or not objects:
+                continue
+            if len(subjects) > 1 and len(objects) > 1:
+                continue
+            for subject in subjects:
+                for object_ in objects:
+                    internal.append(
+                        _normalize_relation_direction(
+                            ExtractedRelation(
+                                subject=subject.name,
+                                subject_type=subject.entity_type,
+                                relation_type=group.relation_type,
+                                object=object_.name,
+                                object_type=object_.entity_type,
+                                description=group.description,
+                                keywords=[],
+                                evidence_text=group.evidence_text,
+                                confidence=group.confidence,
+                            )
+                        )
+                    )
+
+        return _dedupe_relations(internal)
 
 
 
@@ -274,8 +497,8 @@ class LLMExtractedGraph(BaseModel):
                 ExtractedEntity(
                     name=entity.name,
                     entity_type=entity.entity_type,
-                    aliases=[],
-                    surface_forms=[],
+                    aliases=list(getattr(entity, "explicit_aliases", []) or []),
+                    surface_forms=list(getattr(entity, "mentions", []) or []),
                     description=entity.description,
                     evidence_text=entity.evidence_text,
                     is_anchor_candidate=entity.is_anchor_candidate,

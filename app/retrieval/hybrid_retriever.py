@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
+from app.retrieval.chunk_postprocessing import collapse_fact_window_chunks_to_parents
 from app.retrieval.graph_scoring import GraphQueryScorer
 from app.retrieval.hipporag_retriever import HippoRAGRetriever
 from app.retrieval.lightrag_retriever import LightRAGRetriever
@@ -76,6 +77,10 @@ class HybridRetriever:
             (lightrag_result.chunks, branch_weights["lightrag"]),
             (hipporag_result.chunks, branch_weights["hipporag"]),
         ])
+        fused_all = collapse_fact_window_chunks_to_parents(
+            fused_all,
+            graph_repo=self.hipporag_retriever.graph_repo,
+        )
         fused_chunks, guard_debug = self._apply_final_guard(
             query=query,
             keywords=keywords,

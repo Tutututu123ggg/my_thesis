@@ -5,6 +5,7 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass
 
+from app.retrieval.chunk_postprocessing import collapse_fact_window_chunks_to_parents
 from app.retrieval.evidence_expander import EvidenceExpansionConfig, GraphEvidenceExpander
 from app.retrieval.graph_retriever import GraphRetriever
 from app.retrieval.graph_scoring import GraphQueryScorer
@@ -216,6 +217,11 @@ class LightRAGRetriever:
                 relations=relations,
                 analysis=analysis,
             )
+
+        chunks = collapse_fact_window_chunks_to_parents(
+            chunks,
+            graph_repo=self.graph_retriever.graph_repo,
+        )
 
         return RetrievalResult(
             query=query,
